@@ -1,0 +1,9 @@
+services:
+  multica-mcp-server:
+    build: .
+    container_name: multica-mcp-server
+    env_file:
+      - .env
+    ports:
+      - "8090:8090"
+    restart: unless-stopped

@@ -31,8 +31,13 @@ function hasLegacyToken(): boolean {
 function deriveWsUrl(): string | undefined {
   if (process.env.NEXT_PUBLIC_WS_URL) return process.env.NEXT_PUBLIC_WS_URL;
   if (typeof window === "undefined") return undefined;
+  const apiBasePath = process.env.NEXT_PUBLIC_API_URL || "";
+  const wsPath =
+    apiBasePath.startsWith("/") && apiBasePath.length > 1
+      ? `${apiBasePath}/ws`
+      : "/ws";
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${proto}//${window.location.host}/ws`;
+  return `${proto}//${window.location.host}${wsPath}`;
 }
 
 // Build-time version preferred (CI sets NEXT_PUBLIC_APP_VERSION to a git tag
