@@ -2,6 +2,7 @@ package execenv
 
 import (
 	"encoding/json"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -12,6 +13,10 @@ import (
 
 func testLogger() *slog.Logger {
 	return slog.Default()
+}
+
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
 func TestShortID(t *testing.T) {
@@ -740,17 +745,17 @@ func TestWriteContextFilesOpencodeNativeSkills(t *testing.T) {
 		t.Fatalf("writeContextFiles failed: %v", err)
 	}
 
-	// Skills should be in .config/opencode/skills/ (native discovery).
-	skillMd, err := os.ReadFile(filepath.Join(dir, ".config", "opencode", "skills", "go-conventions", "SKILL.md"))
+	// Skills should be in .opencode/skills/ (native discovery).
+	skillMd, err := os.ReadFile(filepath.Join(dir, ".opencode", "skills", "go-conventions", "SKILL.md"))
 	if err != nil {
-		t.Fatalf("failed to read .config/opencode/skills/go-conventions/SKILL.md: %v", err)
+		t.Fatalf("failed to read .opencode/skills/go-conventions/SKILL.md: %v", err)
 	}
 	if !strings.Contains(string(skillMd), "Follow Go conventions.") {
 		t.Error("SKILL.md missing content")
 	}
 
-	// Supporting files should also be under .config/opencode/skills/.
-	supportFile, err := os.ReadFile(filepath.Join(dir, ".config", "opencode", "skills", "go-conventions", "templates", "example.go"))
+	// Supporting files should also be under .opencode/skills/.
+	supportFile, err := os.ReadFile(filepath.Join(dir, ".opencode", "skills", "go-conventions", "templates", "example.go"))
 	if err != nil {
 		t.Fatalf("failed to read supporting file: %v", err)
 	}
@@ -1375,6 +1380,51 @@ func TestPrepareCodexHomeSkipsMissingFiles(t *testing.T) {
 	}
 }
 
+// Regression for issue #2081: when the per-task auth.json is a stale regular
+// file (e.g. left behind from an earlier Windows copy fallback), a subsequent
+// Reuse() / prepareCodexHome must refresh it from the shared source rather
+// than preserve the stale copy. Without this, Codex would keep retrying with
+// a refresh token the OAuth server has already revoked, surfacing as
+// `refresh_token_reused` / `token_expired` until the user manually nukes the
+// workspace directory.
+func TestPrepareCodexHome_RefreshesStaleAuthCopyOnReuse(t *testing.T) {
+	// Cannot use t.Parallel() with t.Setenv.
+
+	sharedHome := t.TempDir()
+	os.WriteFile(filepath.Join(sharedHome, "auth.json"), []byte(`{"refresh_token":"v1"}`), 0o644)
+	t.Setenv("CODEX_HOME", sharedHome)
+
+	codexHome := filepath.Join(t.TempDir(), "codex-home")
+
+	// Pre-seed the per-task home with a stale regular-file auth.json,
+	// simulating a previous run where os.Symlink failed and createFileLink
+	// fell back to copying.
+	if err := os.MkdirAll(codexHome, 0o755); err != nil {
+		t.Fatalf("mkdir codex-home: %v", err)
+	}
+	stalePath := filepath.Join(codexHome, "auth.json")
+	if err := os.WriteFile(stalePath, []byte(`{"refresh_token":"v0_stale"}`), 0o644); err != nil {
+		t.Fatalf("seed stale auth: %v", err)
+	}
+
+	// Shared source rotates to v2 while the per-task copy is still stuck on v0.
+	os.WriteFile(filepath.Join(sharedHome, "auth.json"), []byte(`{"refresh_token":"v2"}`), 0o644)
+
+	if err := prepareCodexHome(codexHome, testLogger()); err != nil {
+		t.Fatalf("prepareCodexHome failed: %v", err)
+	}
+
+	// After Reuse, dst should mirror the current shared source — either as a
+	// fresh symlink (preferred) or as a fresh copy (Windows fallback).
+	data, err := os.ReadFile(stalePath)
+	if err != nil {
+		t.Fatalf("read auth.json: %v", err)
+	}
+	if string(data) != `{"refresh_token":"v2"}` {
+		t.Errorf("auth.json content = %q, want refreshed v2 contents", data)
+	}
+}
+
 func TestEnsureCodexSandboxConfigCreatesDefaultLinux(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -1916,7 +1966,11 @@ func TestWriteReadGCMeta(t *testing.T) {
 	issueID := "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 	wsID := "ws-test-001"
 
-	if err := WriteGCMeta(dir, issueID, wsID); err != nil {
+	if err := WriteGCMeta(dir, GCMeta{
+		Kind:        GCKindIssue,
+		IssueID:     issueID,
+		WorkspaceID: wsID,
+	}, discardLogger()); err != nil {
 		t.Fatalf("WriteGCMeta: %v", err)
 	}
 
@@ -1925,6 +1979,9 @@ func TestWriteReadGCMeta(t *testing.T) {
 		t.Fatalf("ReadGCMeta: %v", err)
 	}
 
+	if meta.Kind != GCKindIssue {
+		t.Errorf("Kind = %q, want %q", meta.Kind, GCKindIssue)
+	}
 	if meta.IssueID != issueID {
 		t.Errorf("IssueID = %q, want %q", meta.IssueID, issueID)
 	}
@@ -1938,8 +1995,74 @@ func TestWriteReadGCMeta(t *testing.T) {
 
 func TestWriteGCMeta_EmptyRoot(t *testing.T) {
 	t.Parallel()
-	if err := WriteGCMeta("", "issue", "ws"); err != nil {
+	if err := WriteGCMeta("", GCMeta{Kind: GCKindIssue, IssueID: "x", WorkspaceID: "ws"}, discardLogger()); err != nil {
 		t.Fatalf("expected nil for empty root, got %v", err)
+	}
+}
+
+func TestWriteGCMeta_EmptyKind(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	if err := WriteGCMeta(dir, GCMeta{WorkspaceID: "ws"}, discardLogger()); err != nil {
+		t.Fatalf("expected nil for empty kind, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, gcMetaFile)); !os.IsNotExist(err) {
+		t.Fatalf("expected gc meta file to be absent, got err=%v", err)
+	}
+}
+
+// Pre-v2 meta files lacked the kind field. ReadGCMeta must default an empty
+// kind to GCKindIssue so the existing on-disk meta files keep flowing
+// through the issue path.
+func TestReadGCMeta_LegacyFileDefaultsToIssueKind(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	legacy := []byte(`{"issue_id":"a1b2c3d4-e5f6-7890-abcd-ef1234567890","workspace_id":"ws","completed_at":"2025-01-01T00:00:00Z"}`)
+	if err := os.WriteFile(filepath.Join(dir, gcMetaFile), legacy, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := ReadGCMeta(dir)
+	if err != nil {
+		t.Fatalf("ReadGCMeta: %v", err)
+	}
+	if meta.Kind != GCKindIssue {
+		t.Fatalf("legacy kind: want %q, got %q", GCKindIssue, meta.Kind)
+	}
+	if meta.IssueID != "a1b2c3d4-e5f6-7890-abcd-ef1234567890" {
+		t.Fatalf("legacy issue_id: got %q", meta.IssueID)
+	}
+}
+
+// New v2 meta files for chat / autopilot / quick-create round-trip without
+// being misclassified as the issue kind.
+func TestWriteReadGCMeta_KindRoundTrip(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		meta GCMeta
+		want GCMetaKind
+	}{
+		{"chat", GCMeta{Kind: GCKindChat, ChatSessionID: "cs-1", WorkspaceID: "ws"}, GCKindChat},
+		{"autopilot_run", GCMeta{Kind: GCKindAutopilotRun, AutopilotRunID: "ar-1", WorkspaceID: "ws"}, GCKindAutopilotRun},
+		{"quick_create", GCMeta{Kind: GCKindQuickCreate, TaskID: "t-1", WorkspaceID: "ws"}, GCKindQuickCreate},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			if err := WriteGCMeta(dir, tc.meta, discardLogger()); err != nil {
+				t.Fatalf("WriteGCMeta: %v", err)
+			}
+			got, err := ReadGCMeta(dir)
+			if err != nil {
+				t.Fatalf("ReadGCMeta: %v", err)
+			}
+			if got.Kind != tc.want {
+				t.Fatalf("Kind: want %q, got %q", tc.want, got.Kind)
+			}
+		})
 	}
 }
 

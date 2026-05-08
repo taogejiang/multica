@@ -47,6 +47,16 @@ type Config struct {
 	AllowSignup         bool
 	AllowedEmails       []string
 	AllowedEmailDomains []string
+	// UseDailyRollupForRuntimeUsage routes ListRuntimeUsage to the
+	// task_usage_daily rollup table when true. Default false: the read
+	// path stays on the raw task_usage stream so rollup-related issues
+	// (pg_cron not running, backfill not yet performed, watermark stuck)
+	// can never make the dashboard return empty/stale data. Operators
+	// flip this on per environment AFTER:
+	//   1) migrations 072..076 applied,
+	//   2) backfill_task_usage_daily ran successfully,
+	//   3) cron job scheduled and task_usage_rollup_lag_seconds() < 900.
+	UseDailyRollupForRuntimeUsage bool
 }
 
 type Handler struct {
@@ -59,10 +69,12 @@ type Handler struct {
 	TaskService           *service.TaskService
 	AutopilotService      *service.AutopilotService
 	EmailService          *service.EmailService
-	UpdateStore           *UpdateStore
+	UpdateStore           UpdateStore
 	ModelListStore        ModelListStore
 	LocalSkillListStore   LocalSkillListStore
 	LocalSkillImportStore LocalSkillImportStore
+	LivenessStore         LivenessStore
+	HeartbeatScheduler    HeartbeatScheduler
 	Storage               storage.Storage
 	CFSigner              *auth.CloudFrontSigner
 	Analytics             analytics.Client
@@ -97,10 +109,12 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 		TaskService:           taskSvc,
 		AutopilotService:      service.NewAutopilotService(queries, txStarter, bus, taskSvc),
 		EmailService:          emailService,
-		UpdateStore:           NewUpdateStore(),
+		UpdateStore:           NewInMemoryUpdateStore(),
 		ModelListStore:        NewInMemoryModelListStore(),
 		LocalSkillListStore:   NewInMemoryLocalSkillListStore(),
 		LocalSkillImportStore: NewInMemoryLocalSkillImportStore(),
+		LivenessStore:         NewNoopLivenessStore(),
+		HeartbeatScheduler:    NewPassthroughHeartbeatScheduler(queries),
 		Storage:               store,
 		CFSigner:              cfSigner,
 		Analytics:             analyticsClient,

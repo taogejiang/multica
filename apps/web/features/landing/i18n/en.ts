@@ -94,7 +94,7 @@ export function createEnDict(allowSignup: boolean): LandingDict {
       label: "RUNTIMES",
       title: "One dashboard for all your compute",
       description:
-        "Local daemons and cloud runtimes, managed from a single panel. Real-time monitoring of online/offline status, usage charts, and activity heatmaps. Auto-detects local CLIs \u2014 plug in and go.",
+        "Local daemons and cloud runtimes, managed from a single panel. Real-time monitoring of online/offline status, usage charts, and activity heatmaps. Auto-detects 11 supported coding tools on your machine.",
       cards: [
         {
           title: "Unified runtime panel",
@@ -107,9 +107,9 @@ export function createEnDict(allowSignup: boolean): LandingDict {
             "Online/offline status, usage charts, and activity heatmaps. Know exactly what your compute is doing at any moment.",
         },
         {
-          title: "Auto-detection & plug-and-play",
+          title: "Auto-detection on first run",
           description:
-            "Multica detects available CLIs like Claude Code, Codex, OpenClaw, and OpenCode automatically. Connect a machine, and it\u2019s ready to work.",
+            "Multica scans for 11 supported coding tools \u2014 Claude Code, Codex, Cursor, Copilot, Gemini, Hermes, Kimi, Kiro CLI, OpenCode, OpenClaw, and Pi \u2014 and registers a runtime for each one it finds.",
         },
       ],
     },
@@ -129,7 +129,7 @@ export function createEnDict(allowSignup: boolean): LandingDict {
       {
         title: "Install the CLI & connect your machine",
         description:
-          "Run multica setup to configure, authenticate, and start the daemon. It auto-detects Claude Code, Codex, OpenClaw, and OpenCode on your machine \u2014 plug in and go.",
+          "Run multica setup \u2014 it walks you through OAuth, starts the daemon, and scans for the 11 supported coding tools (Claude Code, Codex, Cursor, Copilot, Gemini, Hermes, Kimi, Kiro CLI, OpenCode, OpenClaw, Pi). Whichever ones you already have installed get registered as runtimes automatically.",
       },
       {
         title: "Create your first agent",
@@ -185,7 +185,7 @@ export function createEnDict(allowSignup: boolean): LandingDict {
       {
         question: "What coding agents does Multica support?",
         answer:
-          "Multica currently supports Claude Code, Codex, OpenClaw, and OpenCode out of the box. The daemon auto-detects whichever CLIs you have installed. Since it\u2019s open source, you can also add your own backends.",
+          "Multica supports 11 coding tools out of the box: Claude Code, Codex, Cursor, Copilot, Gemini, Hermes, Kimi, Kiro CLI, OpenCode, OpenClaw, and Pi. The daemon auto-detects whichever CLIs you already have installed and registers a runtime for each one. Since it's open source, you can also add your own backends.",
       },
       {
         question: "Do I need to self-host, or is there a cloud version?",
@@ -283,6 +283,90 @@ export function createEnDict(allowSignup: boolean): LandingDict {
       fixes: "Bug Fixes",
     },
     entries: [
+      {
+        version: "0.2.28",
+        date: "2026-05-08",
+        title: "Daemon Disk-Usage CLI, Timeline Polish & Task Usage Rollup",
+        changes: [],
+        features: [
+          "New `multica daemon disk-usage` CLI surfaces per-task and per-workspace disk footprint",
+          "Skill picker in agent settings has a search box for fast lookup",
+          "Daemon GC extends to chat, autopilot, and quick-create tasks",
+          "Issue detail breadcrumb now shows the MUL-xxxx identifier for quick reference",
+        ],
+        improvements: [
+          "Timeline page size bumped to 50, with per-pool keyset cursors for comments and activities",
+          "'Show older / newer' affordances now appear in edge cases and look clearly clickable",
+          "Server `task_usage` rolls up into a daily aggregate table, dropping DB load significantly",
+          "Daemon health check stays responsive while repo lookups are in flight",
+          "Runtime stats exclude archived agents for accurate active counts",
+        ],
+        fixes: [
+          "Linux daemon self-restart uses `brew prefix` symlinks, so Homebrew Cellar deletion no longer orphans runtimes",
+          "CLI short IDs now route correctly — copied prefixes no longer 404",
+          "Windows non-ASCII comment / description input lands via new `--content-file` / `--description-file` flags",
+          "Windows / Linux desktop replaces the Electron placeholder icon with the Multica asterisk",
+          "Orphaned timeline replies are now correctly surfaced",
+          "Timeline comment pagination budget excludes activities, so heavy activity no longer crowds out real comments",
+        ],
+      },
+      {
+        version: "0.2.27",
+        date: "2026-05-07",
+        title: "Smoother Chat, GitHub Skill Import & Stability Fixes",
+        changes: [],
+        features: [
+          "Import reusable skills directly from GitHub links",
+        ],
+        improvements: [
+          "Chat and Inbox feel smoother, with clearer history, easier reply copying, and faster triage after archiving",
+          "Issue actions keep more context, from easier access to the local folder to sub-issues inheriting the right project and status",
+          "Autopilots pause themselves after repeated failures, so noisy automations are easier to catch and fix",
+        ],
+        fixes: [
+          "Chinese input, desktop updates, long issue timelines, and live status updates are more reliable",
+        ],
+      },
+      {
+        version: "0.2.26",
+        date: "2026-05-06",
+        title: "Full i18n Rollout, Long-Issue Timeline & System Notifications Toggle",
+        changes: [],
+        features: [
+          "Web app fully translated to Simplified Chinese (21 namespaces), with per-user locale",
+          "System Notifications toggle in Settings",
+          "Delete chat sessions; History panel surfaced on the chat header",
+          "Runtime liveness backed by Redis, with DB fallback",
+          "Desktop loads runtime self-host config",
+          "CLI adds `--assignee-id` / `--to-id` / `--user-id` for unambiguous targeting",
+        ],
+        improvements: [
+          "Settings 'Appearance' tab is renamed to 'Preferences', and the active tab is reflected in the URL so deep links work",
+          "Long issues open instantly — Timeline switched to cursor-based keyset pagination, and repeated `task_completed` / `task_failed` activity entries are coalesced",
+          "Runtime poll and heartbeat schedules are isolated per-runtime, so one busy runtime can no longer starve others",
+          "CLI update requests persist in Redis, so a server restart no longer drops them",
+          "Runtime cost usage window narrowed from 180 days to 14 days, dropping query load",
+          "Project list returns a `resource_count` instead of inlining all resources, keeping responses lean",
+          "404 page redesigned, with the No-Access redirect loop fixed",
+          "Quick Create exempts git-describe daemons from the CLI version gate",
+          "CI now enforces lint on every PR, and the existing lint debt has been cleared",
+        ],
+        fixes: [
+          "Daemon cancels the running agent when the task is deleted server-side, eliminating orphan processes",
+          "Daemon refreshes a stale Codex `auth.json` when reusing an exec env, fixing intermittent auth errors",
+          "Daemon refuses to write `.gc_meta.json` when `issue_id` is empty",
+          "Session / resume across ACP backends now trusts the agent-reported session id, fixing cross-session bleed",
+          "OpenCode skills are written under `.opencode/skills/` so they are discovered natively",
+          "404 task-not-found semantics tightened on both server and the final guard",
+          "Pinned sidebar rows are auto-unpinned when the underlying entity disappears",
+          "Project detail page splits desktop and mobile sidebar state",
+          "Runtime detail page hides archived agents",
+          "Already-attached repos in Add Resource show a URL tooltip; empty project state has a New Issue button",
+          "S3 public URLs are region-qualified, fixing cross-region access",
+          "Windows installer parses version numbers and decodes checksums correctly",
+          "Quick Create submit button no longer shows a duplicate keyboard shortcut",
+        ],
+      },
       {
         version: "0.2.24",
         date: "2026-05-03",
