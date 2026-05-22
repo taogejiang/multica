@@ -16,6 +16,7 @@ def _env(name: str, default: str = "") -> str:
 
 
 BASE_URL = _env("MULTICA_BASE_URL", "http://host.docker.internal:38080").rstrip("/")
+FRONTEND_URL = _env("MULTICA_FRONTEND_URL", "").rstrip("/")
 DEFAULT_WORKSPACE_ID = _env("MULTICA_WORKSPACE_ID")
 REQUEST_TIMEOUT_SECONDS = float(_env("REQUEST_TIMEOUT_SECONDS", "20") or "20")
 LOG_LEVEL = _env("LOG_LEVEL", "INFO").upper()
@@ -167,6 +168,17 @@ async def create_issue(
         payload["assignee_agent_id"] = assignee_agent_id
     path = _merge_workspace("/api/issues", workspace_id)
     result = await _multica_post(path, payload)
+    if FRONTEND_URL and isinstance(result, dict):
+        identifier = result.get("identifier", "")
+        ws_id = result.get("workspace_id", "")
+        if identifier and ws_id:
+            try:
+                ws = await _multica_get(f"/api/workspaces/{ws_id}")
+                slug = ws.get("slug", "") if isinstance(ws, dict) else ""
+                if slug:
+                    result["url"] = f"{FRONTEND_URL}/{slug}/issues/{identifier}"
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to fetch workspace slug for issue URL: %s", exc)
     return str(result)
 
 
