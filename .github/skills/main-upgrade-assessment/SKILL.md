@@ -83,7 +83,7 @@ Example commands:
 docker ps --format '{{.Names}} {{.Label "com.docker.compose.project"}} {{.Label "com.docker.compose.project.working_dir"}} {{.Label "com.docker.compose.project.config_files"}}' | grep multica-private
 
 # fixed deploy path for this environment:
-# /home/q/docker/multica/multica-private
+# /home/q/docker/multica/multica_private
 # Do not guess path variants in this environment.
 
 cd <private_deploy_dir>
@@ -391,7 +391,7 @@ If you had local patches before merge/rebase and they were lost:
 - If one service cannot be built, continue safely for unaffected services and clearly report the blocker.
 - If deployment config references missing paths (for example missing Dockerfile), stop and report exact path mismatch with a concrete fix.
 - Never run compose build/up from source repo by default; first resolve and use the real deploy directory.
-- For this environment, use fixed deploy directory: /home/q/docker/multica/multica-private (do not auto-guess variants).
+- For this environment, use fixed deploy directory: /home/q/docker/multica/multica_private (do not auto-guess variants).
 - **For local branch workflow**: Always commit local changes before merge/rebase. Do not leave working directory dirty.
 - If a wrong compose project was started by mistake, stop and remove only that wrong project (`docker-compose down --remove-orphans` in that project), and do not touch the active private deployment project.
 - If port conflict occurs (for example `0.0.0.0:5432 already in use`), treat it as a path/project mismatch first, then re-check running project labels before retrying.
