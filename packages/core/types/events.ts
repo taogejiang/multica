@@ -1,4 +1,4 @@
-import type { Issue, IssueReaction } from "./issue";
+import type { Issue, IssueMetadata, IssueReaction } from "./issue";
 import type { Agent } from "./agent";
 import type { InboxItem } from "./inbox";
 import type { Comment, Reaction } from "./comment";
@@ -15,6 +15,8 @@ export type WSEventType =
   | "comment:created"
   | "comment:updated"
   | "comment:deleted"
+  | "comment:resolved"
+  | "comment:unresolved"
   | "agent:status"
   | "agent:created"
   | "agent:archived"
@@ -52,25 +54,36 @@ export type WSEventType =
   | "chat:done"
   | "chat:session_read"
   | "chat:session_deleted"
+  | "chat:session_updated"
   | "project:created"
   | "project:updated"
   | "project:deleted"
+  | "squad:created"
+  | "squad:updated"
+  | "squad:deleted"
   | "label:created"
   | "label:updated"
   | "label:deleted"
   | "issue_labels:changed"
+  | "issue_metadata:changed"
   | "pin:created"
   | "pin:deleted"
   | "pin:reordered"
   | "invitation:created"
   | "invitation:accepted"
   | "invitation:declined"
-  | "invitation:revoked";
+  | "invitation:revoked"
+  | "github_installation:created"
+  | "github_installation:deleted"
+  | "pull_request:linked"
+  | "pull_request:updated"
+  | "pull_request:unlinked";
 
 export interface WSMessage<T = unknown> {
   type: WSEventType;
   payload: T;
   actor_id?: string;
+  actor_type?: string;
 }
 
 export interface IssueCreatedPayload {
@@ -88,6 +101,11 @@ export interface IssueDeletedPayload {
 export interface IssueLabelsChangedPayload {
   issue_id: string;
   labels: Label[];
+}
+
+export interface IssueMetadataChangedPayload {
+  issue_id: string;
+  metadata: IssueMetadata;
 }
 
 export interface AgentStatusPayload {
@@ -141,6 +159,14 @@ export interface CommentUpdatedPayload {
 export interface CommentDeletedPayload {
   comment_id: string;
   issue_id: string;
+}
+
+export interface CommentResolvedPayload {
+  comment: Comment;
+}
+
+export interface CommentUnresolvedPayload {
+  comment: Comment;
 }
 
 export interface WorkspaceUpdatedPayload {
@@ -274,7 +300,16 @@ export interface ChatMessageEventPayload {
 export interface ChatDonePayload {
   chat_session_id: string;
   task_id: string;
+  /**
+   * Server populates these from the freshly-persisted assistant ChatMessage
+   * row so the WS handler can write it into the messages cache inline. Older
+   * servers (pre-#2123) only sent chat_session_id + task_id; treat every field
+   * below as optional and fall back to a refetch when absent.
+   */
+  message_id?: string;
   content?: string;
+  elapsed_ms?: number;
+  created_at?: string;
 }
 
 export interface ChatSessionReadPayload {

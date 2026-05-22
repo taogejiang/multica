@@ -30,12 +30,11 @@ import { RadioMark } from "../components/option-card";
 import { WorkspaceAvatar } from "../../workspace/workspace-avatar";
 import { useT } from "../../i18n";
 import {
-  WORKSPACE_SLUG_CONFLICT_ERROR,
-  WORKSPACE_SLUG_FORMAT_ERROR,
   WORKSPACE_SLUG_REGEX,
   isWorkspaceSlugConflict,
   nameToWorkspaceSlug,
 } from "../../workspace/slug";
+import { isReservedSlug } from "@multica/core/paths";
 
 /**
  * Step 2 — create your first workspace, or continue with one set up in
@@ -102,9 +101,13 @@ export function StepWorkspace({
 
   const slugValidationError =
     slug.length > 0 && !WORKSPACE_SLUG_REGEX.test(slug)
-      ? WORKSPACE_SLUG_FORMAT_ERROR
+      ? t(($) => $.step_workspace.slug_format_error)
       : null;
-  const slugError = slugValidationError ?? slugServerError;
+  const slugReservedError =
+    slug.length > 0 && isReservedSlug(slug)
+      ? t(($) => $.step_workspace.slug_reserved_error)
+      : null;
+  const slugError = slugValidationError ?? slugReservedError ?? slugServerError;
   const canCreate =
     name.trim().length > 0 && slug.trim().length > 0 && !slugError;
 
@@ -132,11 +135,15 @@ export function StepWorkspace({
         onSuccess: onCreated,
         onError: (error) => {
           if (isWorkspaceSlugConflict(error)) {
-            setSlugServerError(WORKSPACE_SLUG_CONFLICT_ERROR);
+            setSlugServerError(t(($) => $.step_workspace.slug_taken_error));
             toast.error(t(($) => $.step_workspace.slug_conflict_toast));
             return;
           }
-          toast.error(t(($) => $.step_workspace.create_failed_toast));
+          toast.error(
+            error instanceof Error && error.message
+              ? error.message
+              : t(($) => $.step_workspace.create_failed_toast),
+          );
         },
       },
     );
@@ -314,18 +321,21 @@ export function StepWorkspace({
                 createFields
               )}
             </div>
+
+            <div className="mt-8 flex flex-wrap items-center justify-end gap-x-4 gap-y-2">
+              <span
+                aria-live="polite"
+                className="mr-auto text-xs text-muted-foreground"
+              >
+                {hint}
+              </span>
+              <Button size="lg" disabled={continueDisabled} onClick={onContinue}>
+                {continueLabel}
+                <ArrowRight className="h-4 w-4" />
+              </Button>
+            </div>
           </div>
         </main>
-
-        <footer className="flex shrink-0 items-center justify-end gap-4 bg-background px-6 py-4 sm:px-10 md:px-14 lg:px-16">
-          <span aria-live="polite" className="text-xs text-muted-foreground">
-            {hint}
-          </span>
-          <Button size="lg" disabled={continueDisabled} onClick={onContinue}>
-            {continueLabel}
-            <ArrowRight className="h-4 w-4" />
-          </Button>
-        </footer>
       </div>
 
       {/* Right — side panel.

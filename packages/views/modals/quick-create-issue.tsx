@@ -1,23 +1,21 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeftRight, Check, ChevronRight, X as XIcon } from "lucide-react";
+import { ArrowLeftRight, Check, ChevronRight, Maximize2, Minimize2, X as XIcon } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { DialogTitle } from "@multica/ui/components/ui/dialog";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@multica/ui/components/ui/dropdown-menu";
 import { Button } from "@multica/ui/components/ui/button";
 import { Switch } from "@multica/ui/components/ui/switch";
 import { api, ApiError } from "@multica/core/api";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { useCurrentWorkspace } from "@multica/core/paths";
-import { agentListOptions } from "@multica/core/workspace/queries";
-import { useQuickCreateStore } from "@multica/core/issues/stores/quick-create-store";
+import { agentListOptions, squadListOptions } from "@multica/core/workspace/queries";
+import { projectListOptions } from "@multica/core/projects/queries";
+import {
+  useQuickCreateStore,
+  type QuickCreateActorType,
+} from "@multica/core/issues/stores/quick-create-store";
 import { useIssueDraftStore } from "@multica/core/issues/stores/draft-store";
 import { useCreateModeStore } from "@multica/core/issues/stores/create-mode-store";
 import {
@@ -28,9 +26,17 @@ import {
 } from "@multica/core/runtimes";
 import { useFileUpload } from "@multica/core/hooks/use-file-upload";
 import { formatShortcut, modKey, enterKey } from "@multica/core/platform";
-import type { Agent } from "@multica/core/types";
+import type { Agent, Squad } from "@multica/core/types";
 import { ActorAvatar } from "../common/actor-avatar";
+import { PillButton } from "../common/pill-button";
+import { ProjectPicker } from "../projects/components/project-picker";
 import { canAssignAgent } from "../issues/components/pickers/assignee-picker";
+import {
+  PropertyPicker,
+  PickerItem,
+  PickerSection,
+  PickerEmpty,
+} from "../issues/components/pickers/property-picker";
 import { useAuthStore } from "@multica/core/auth";
 import { memberListOptions } from "@multica/core/workspace/queries";
 import {
@@ -41,6 +47,11 @@ import {
 } from "../editor";
 import { FileUploadButton } from "@multica/ui/components/common/file-upload-button";
 import { useT } from "../i18n";
+import { matchesPinyin } from "../editor/extensions/pinyin-match";
+
+type ActorSelection =
+  | { type: "agent"; id: string }
+  | { type: "squad"; id: string };
 
 // AgentCreatePanel — agent-mode body of the create-issue dialog. Renders
 // only the inner content; the surrounding `<Dialog>` AND `<DialogContent>`
@@ -49,16 +60,26 @@ import { useT } from "../i18n";
 // animation flash — Base UI replays Popup enter/exit when DialogContent is
 // remounted, even inside a still-open Dialog Root.
 //
-// `onSwitchMode` is wired by the shell — the panel calls it (no payload from
-// agent → manual; the shared draft store carries description + agent).
+// `onSwitchMode` is wired by the shell — the panel calls it with an optional
+// carry payload (currently `project_id`). The shared draft store carries the
+// description + agent across the agent→manual flip; project_id rides through
+// the same carry channel manual→agent uses, so the manual panel reads it
+// from `data?.project_id` without a parallel store.
 export function AgentCreatePanel({
   onClose,
   onSwitchMode,
   data,
+  isExpanded,
+  setIsExpanded,
 }: {
   onClose: () => void;
-  onSwitchMode?: () => void;
+  onSwitchMode?: (carry?: Record<string, unknown> | null) => void;
   data?: Record<string, unknown> | null;
+  /** Lifted to the shell so DialogContent's mode-aware className can react —
+   *  same pattern as ManualCreatePanel. Shared across modes so the user's
+   *  expand preference persists when switching between agent and manual. */
+  isExpanded: boolean;
+  setIsExpanded: (v: boolean) => void;
 }) {
   const { t } = useT("modals");
   const workspaceName = useCurrentWorkspace()?.name;
@@ -66,13 +87,23 @@ export function AgentCreatePanel({
   const userId = useAuthStore((s) => s.user?.id);
   const { data: members = [] } = useQuery(memberListOptions(wsId));
   const { data: agents = [] } = useQuery(agentListOptions(wsId));
+  const { data: squads = [] } = useQuery(squadListOptions(wsId));
+  // Pull `isSuccess` so the stale-id sweep below can distinguish "still
+  // loading" from "loaded as empty". Reading length alone treats both as
+  // empty and incorrectly clears a valid persisted preference on every open.
+  const { data: projects = [], isSuccess: projectsLoaded } = useQuery(
+    projectListOptions(wsId),
+  );
 
   const memberRole = useMemo(
     () => members.find((m) => m.user_id === userId)?.role,
     [members, userId],
   );
 
-  // Visible = not archived AND assignable by this user.
+  // Visible = not archived AND assignable by this user. Squads inherit
+  // their leader agent's reachability: the backend always routes a squad
+  // pick to the leader, so hiding squads whose leader isn't visible keeps
+  // the picker honest with what the server would actually accept.
   const visibleAgents = useMemo(
     () =>
       agents.filter(
@@ -80,9 +111,23 @@ export function AgentCreatePanel({
       ),
     [agents, userId, memberRole],
   );
+  const visibleAgentIds = useMemo(
+    () => new Set(visibleAgents.map((a) => a.id)),
+    [visibleAgents],
+  );
+  const visibleSquads = useMemo(
+    () =>
+      squads.filter(
+        (s) => !s.archived_at && visibleAgentIds.has(s.leader_id),
+      ),
+    [squads, visibleAgentIds],
+  );
 
-  const lastAgentId = useQuickCreateStore((s) => s.lastAgentId);
-  const setLastAgentId = useQuickCreateStore((s) => s.setLastAgentId);
+  const lastActorType = useQuickCreateStore((s) => s.lastActorType);
+  const lastActorId = useQuickCreateStore((s) => s.lastActorId);
+  const setLastActor = useQuickCreateStore((s) => s.setLastActor);
+  const lastProjectId = useQuickCreateStore((s) => s.lastProjectId);
+  const setLastProjectId = useQuickCreateStore((s) => s.setLastProjectId);
   const promptDraft = useQuickCreateStore((s) => s.prompt);
   const setPrompt = useQuickCreateStore((s) => s.setPrompt);
   const clearPrompt = useQuickCreateStore((s) => s.clearPrompt);
@@ -90,28 +135,84 @@ export function AgentCreatePanel({
   const setKeepOpen = useQuickCreateStore((s) => s.setKeepOpen);
   const setLastMode = useCreateModeStore((s) => s.setLastMode);
 
-  const [agentId, setAgentId] = useState<string | undefined>(() => {
-    const seed = (data?.agent_id as string) || lastAgentId || undefined;
-    if (seed && visibleAgents.some((a) => a.id === seed)) return seed;
-    return visibleAgents[0]?.id;
+  // Resolve a candidate actor against the currently-visible agents / squads.
+  // Returns null when the candidate doesn't exist in this workspace right
+  // now (deleted, archived, permission revoked, etc.) so callers can fall
+  // through to the next seed in the chain.
+  const resolveActor = useCallback(
+    (
+      type: QuickCreateActorType | "agent" | "squad" | null | undefined,
+      id: string | null | undefined,
+    ): ActorSelection | null => {
+      if (!type || !id) return null;
+      if (type === "squad" && visibleSquads.some((s) => s.id === id)) {
+        return { type: "squad", id };
+      }
+      if (type === "agent" && visibleAgentIds.has(id)) {
+        return { type: "agent", id };
+      }
+      return null;
+    },
+    [visibleSquads, visibleAgentIds],
+  );
+
+  const seedActor = useCallback((): ActorSelection | null => {
+    // Caller-provided seed wins (e.g. shell pre-seeds with `agent_id` /
+    // `squad_id`), then persisted preference, then first visible agent.
+    const dataAgent = data?.agent_id as string | undefined;
+    const dataSquad = data?.squad_id as string | undefined;
+    return (
+      resolveActor("agent", dataAgent) ||
+      resolveActor("squad", dataSquad) ||
+      resolveActor(lastActorType, lastActorId) ||
+      (visibleAgents[0]
+        ? ({ type: "agent", id: visibleAgents[0].id } as const)
+        : null)
+    );
+  }, [resolveActor, data?.agent_id, data?.squad_id, lastActorType, lastActorId, visibleAgents]);
+
+  const [actor, setActor] = useState<ActorSelection | null>(() => seedActor());
+
+  // Re-seed once visible lists resolve (queries may be empty on first render).
+  useEffect(() => {
+    if (actor && resolveActor(actor.type, actor.id)) return;
+    setActor(seedActor());
+  }, [actor, resolveActor, seedActor]);
+
+  const selectedAgent = useMemo<Agent | undefined>(() => {
+    if (!actor) return undefined;
+    if (actor.type === "agent") return visibleAgents.find((a) => a.id === actor.id);
+    const squad = visibleSquads.find((s) => s.id === actor.id);
+    if (!squad) return undefined;
+    return visibleAgents.find((a) => a.id === squad.leader_id);
+  }, [actor, visibleAgents, visibleSquads]);
+
+  const selectedSquad = useMemo<Squad | undefined>(() => {
+    if (actor?.type !== "squad") return undefined;
+    return visibleSquads.find((s) => s.id === actor.id);
+  }, [actor, visibleSquads]);
+
+  // Project selection — defaults to the last project the user picked in this
+  // workspace. `data?.project_id` lets the modal opener seed a one-shot
+  // override (e.g. a future "+ Issue" button on a project page); it does NOT
+  // replace the persisted default.
+  const [projectId, setProjectId] = useState<string | null>(() => {
+    const seed = (data?.project_id as string | undefined) ?? lastProjectId;
+    return seed ?? null;
   });
 
-  // Re-seed once visible list resolves (queries may be empty on first render).
+  // Stale-id sweep. Once the project list query has actually resolved
+  // (`isSuccess` — distinct from "data is the empty default during loading"),
+  // a `projectId` that isn't in the list means the project was deleted in
+  // another session. Clear BOTH local state and the persisted preference;
+  // dropping only local state would leave the deleted UUID in `lastProjectId`,
+  // and the next open would re-seed it and submit the same dead value.
   useEffect(() => {
-    if (agentId && visibleAgents.some((a) => a.id === agentId)) return;
-    const seed = (data?.agent_id as string) || lastAgentId || undefined;
-    if (seed && visibleAgents.some((a) => a.id === seed)) {
-      setAgentId(seed);
-      return;
-    }
-    const first = visibleAgents[0];
-    if (first) setAgentId(first.id);
-  }, [visibleAgents, agentId, data?.agent_id, lastAgentId]);
-
-  const selectedAgent = useMemo(
-    () => visibleAgents.find((a) => a.id === agentId),
-    [visibleAgents, agentId],
-  );
+    if (!projectsLoaded || projectId === null) return;
+    if (projects.some((p) => p.id === projectId)) return;
+    setProjectId(null);
+    if (lastProjectId === projectId) setLastProjectId(null);
+  }, [projectsLoaded, projects, projectId, lastProjectId, setLastProjectId]);
 
   // Daemon CLI version gate. The agent-create flow needs the runtime's
   // bundled multica CLI to be ≥ MIN_QUICK_CREATE_CLI_VERSION; older
@@ -169,12 +270,19 @@ export function AgentCreatePanel({
 
   const submit = async () => {
     const md = editorRef.current?.getMarkdown()?.trim() ?? "";
-    if (!md || !agentId || submitting || versionBlocked || uploading) return;
+    if (!md || !actor || submitting || versionBlocked || uploading) return;
     setSubmitting(true);
     setError(null);
     try {
-      await api.quickCreateIssue({ agent_id: agentId, prompt: md });
-      setLastAgentId(agentId);
+      await api.quickCreateIssue({
+        ...(actor.type === "agent"
+          ? { agent_id: actor.id }
+          : { squad_id: actor.id }),
+        prompt: md,
+        project_id: projectId ?? undefined,
+      });
+      setLastActor(actor.type, actor.id);
+      setLastProjectId(projectId);
       clearPrompt();
       setLastMode("agent");
       toast.success(t(($) => $.create_issue.agent.toast_sent), {
@@ -225,7 +333,11 @@ export function AgentCreatePanel({
           return;
         }
       }
-      setError(t(($) => $.create_issue.agent.error_unknown));
+      setError(
+        e instanceof Error && e.message
+          ? e.message
+          : t(($) => $.create_issue.agent.error_unknown),
+      );
     } finally {
       setSubmitting(false);
     }
@@ -233,20 +345,24 @@ export function AgentCreatePanel({
 
   // Switch to the manual form, carrying what the user typed over as the
   // description (markdown, including any pasted images) so they don't lose
-  // their work. The picked agent becomes the default assignee candidate
-  // (still editable). We seed the shared issue-draft store directly because
-  // the manual panel reads its initial values from there. Persist the mode
-  // flip so the next `c` lands in manual.
+  // their work. The picked actor (agent or squad) becomes the default
+  // assignee candidate (still editable). We seed the shared issue-draft
+  // store directly because the manual panel reads its initial values from
+  // there. Persist the mode flip so the next `c` lands in manual.
   const switchToManual = () => {
     const md = editorRef.current?.getMarkdown() ?? "";
     useIssueDraftStore.getState().setDraft({
       description: md,
-      ...(agentId
-        ? { assigneeType: "agent" as const, assigneeId: agentId }
+      ...(actor
+        ? { assigneeType: actor.type, assigneeId: actor.id }
         : {}),
     });
     setLastMode("manual");
-    onSwitchMode?.();
+    // Hand the picked project to the manual panel through the same `data`
+    // channel that already carries agent_id / parent_issue_id. The manual
+    // panel reads `data.project_id` on mount; this preserves the user's
+    // selection across the mode flip without piping a third store through.
+    onSwitchMode?.(projectId ? { project_id: projectId } : null);
   };
 
   return (
@@ -263,73 +379,46 @@ export function AgentCreatePanel({
           {/* Native `title` instead of Base UI Tooltip — Tooltip opens on
               keyboard focus, and the dialog's focus trap briefly lands focus
               on the first focusable element on mount, causing the tooltip to
-              auto-pop every open. */}
-          <button
-            type="button"
-            onClick={onClose}
-            title={t(($) => $.common.close)}
-            aria-label={t(($) => $.common.close)}
-            className="rounded-sm p-1.5 opacity-70 hover:opacity-100 hover:bg-accent/60 transition-all cursor-pointer"
-          >
-            <XIcon className="size-4" />
-          </button>
+              auto-pop every open. Same workaround applies to expand. */}
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={() => setIsExpanded(!isExpanded)}
+              title={isExpanded ? t(($) => $.common.collapse_tooltip) : t(($) => $.common.expand_tooltip)}
+              aria-label={isExpanded ? t(($) => $.common.collapse_tooltip) : t(($) => $.common.expand_tooltip)}
+              className="rounded-sm p-1.5 opacity-70 hover:opacity-100 hover:bg-accent/60 transition-all cursor-pointer"
+            >
+              {isExpanded ? <Minimize2 className="size-4" /> : <Maximize2 className="size-4" />}
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              title={t(($) => $.common.close)}
+              aria-label={t(($) => $.common.close)}
+              className="rounded-sm p-1.5 opacity-70 hover:opacity-100 hover:bg-accent/60 transition-all cursor-pointer"
+            >
+              <XIcon className="size-4" />
+            </button>
+          </div>
         </div>
 
-        {/* Agent picker */}
+        {/* Actor picker — agents and squads in one searchable list. Squads
+            route to their leader agent on the backend; the leader runs the
+            quick-create flow with the squad's Operating Protocol layered
+            on top, so a squad pick is "ask this squad to file the issue". */}
         <div className="px-5 pt-1 pb-2 shrink-0">
-          <DropdownMenu>
-            <DropdownMenuTrigger
-              render={
-                <button
-                  type="button"
-                  aria-label={t(($) => $.create_issue.agent.select_agent_aria)}
-                  className="flex items-center gap-2 text-xs text-muted-foreground hover:text-foreground transition-colors cursor-pointer rounded-sm px-1.5 py-1 -ml-1.5 hover:bg-accent/60"
-                >
-                  <span>{t(($) => $.create_issue.agent.created_by)}</span>
-                  {selectedAgent ? (
-                    <span className="flex items-center gap-1.5 text-foreground">
-                      <ActorAvatar
-                        actorType="agent"
-                        actorId={selectedAgent.id}
-                        size={16}
-                      />
-                      {selectedAgent.name}
-                    </span>
-                  ) : (
-                    <span>{t(($) => $.create_issue.agent.pick_an_agent)}</span>
-                  )}
-                </button>
-              }
-            />
-            <DropdownMenuContent align="start" className="w-64 max-h-72 overflow-y-auto">
-              {visibleAgents.length === 0 ? (
-                <div className="px-2 py-1.5 text-xs text-muted-foreground">
-                  {t(($) => $.create_issue.agent.no_agents)}
-                </div>
-              ) : (
-                visibleAgents.map((a: Agent) => (
-                  <DropdownMenuItem
-                    key={a.id}
-                    onClick={() => {
-                      setAgentId(a.id);
-                      setError(null);
-                    }}
-                    className="flex items-center gap-2"
-                  >
-                    <ActorAvatar
-                      actorType="agent"
-                      actorId={a.id}
-                      size={16}
-                    />
-                    <span className="flex-1 truncate">{a.name}</span>
-                    {agentId === a.id && (
-                      <Check className="size-3.5 text-muted-foreground" />
-                    )}
-                  </DropdownMenuItem>
-                ))
-              )}
-            </DropdownMenuContent>
-          </DropdownMenu>
+          <ActorPicker
+            actor={actor}
+            visibleAgents={visibleAgents}
+            visibleSquads={visibleSquads}
+            selectedAgent={selectedAgent}
+            selectedSquad={selectedSquad}
+            onPick={(next) => {
+              setActor(next);
+              setError(null);
+            }}
+            t={t}
+          />
         </div>
 
         {selectedAgent && versionBlocked && (
@@ -352,7 +441,7 @@ export function AgentCreatePanel({
             editor unbounded and pushed the modal past the viewport. */}
         <div
           {...dropZoneProps}
-          className="relative px-5 pb-3 flex-1 min-h-[140px] overflow-y-auto"
+          className="relative px-5 pb-3 flex flex-1 min-h-[140px] overflow-y-auto"
         >
           <ContentEditor
             ref={editorRef}
@@ -372,6 +461,21 @@ export function AgentCreatePanel({
         {error && (
           <div className="px-5 pb-2 text-xs text-destructive">{error}</div>
         )}
+
+        {/* Property toolbar — mirrors the manual panel's pill row so the
+            project pill sits in the same place across both modes. Agent mode
+            owns only the project (status / priority / assignee / due-date are
+            inferred from the prompt), so it's a single pill. The pick is
+            persisted per-workspace via useQuickCreateStore.lastProjectId so
+            users targeting one project skip retyping "in project X". */}
+        <div className="flex items-center gap-1.5 px-4 pb-2 shrink-0 flex-wrap">
+          <ProjectPicker
+            projectId={projectId}
+            onUpdate={(u) => setProjectId(u.project_id ?? null)}
+            triggerRender={<PillButton />}
+            align="start"
+          />
+        </div>
 
         {/* Footer */}
         <div className="flex flex-col gap-2 border-t px-4 py-3 shrink-0 sm:flex-row sm:items-center sm:justify-between">
@@ -408,7 +512,7 @@ export function AgentCreatePanel({
             <Button
               size="sm"
               onClick={submit}
-              disabled={!hasContent || !agentId || submitting || versionBlocked || uploading}
+              disabled={!hasContent || !actor || submitting || versionBlocked || uploading}
               title={
                 versionBlocked
                   ? t(($) => $.create_issue.agent.version_blocked_tooltip, { min: versionCheck.min })
@@ -423,5 +527,127 @@ export function AgentCreatePanel({
           </div>
         </div>
     </>
+  );
+}
+
+// ActorPicker — the "Created by" trigger + searchable popover listing
+// agents and squads. Lives in this file (not under issues/components/pickers)
+// because it composes the generic PropertyPicker with a quick-create-shaped
+// trigger styled to match the modal header row — promoting it would invite
+// reuse pressure on a UI that's deliberately tuned for this one surface.
+function ActorPicker({
+  actor,
+  visibleAgents,
+  visibleSquads,
+  selectedAgent,
+  selectedSquad,
+  onPick,
+  t,
+}: {
+  actor: ActorSelection | null;
+  visibleAgents: Agent[];
+  visibleSquads: Squad[];
+  selectedAgent: Agent | undefined;
+  selectedSquad: Squad | undefined;
+  onPick: (next: ActorSelection) => void;
+  t: ReturnType<typeof useT<"modals">>["t"];
+}) {
+  const [open, setOpen] = useState(false);
+  const [filter, setFilter] = useState("");
+  const query = filter.trim().toLowerCase();
+
+  const filteredAgents = useMemo(
+    () => visibleAgents.filter((a) => a.name.toLowerCase().includes(query) || matchesPinyin(a.name, query)),
+    [visibleAgents, query],
+  );
+  const filteredSquads = useMemo(
+    () => visibleSquads.filter((s) => s.name.toLowerCase().includes(query) || matchesPinyin(s.name, query)),
+    [visibleSquads, query],
+  );
+
+  const displayLabel = selectedSquad?.name ?? selectedAgent?.name;
+  const displayActor: ActorSelection | null = selectedSquad
+    ? { type: "squad", id: selectedSquad.id }
+    : selectedAgent
+      ? { type: "agent", id: selectedAgent.id }
+      : null;
+
+  return (
+    <PropertyPicker
+      open={open}
+      onOpenChange={(v: boolean) => {
+        setOpen(v);
+        if (!v) setFilter("");
+      }}
+      width="w-64"
+      align="start"
+      searchable
+      searchPlaceholder={t(($) => $.create_issue.agent.search_placeholder)}
+      onSearchChange={setFilter}
+      trigger={
+        <span className="flex items-center gap-2 text-xs text-muted-foreground hover:text-foreground transition-colors">
+          <span>{t(($) => $.create_issue.agent.created_by)}</span>
+          {displayActor && displayLabel ? (
+            <span className="flex items-center gap-1.5 text-foreground">
+              <ActorAvatar
+                actorType={displayActor.type}
+                actorId={displayActor.id}
+                size={16}
+              />
+              {displayLabel}
+            </span>
+          ) : (
+            <span>{t(($) => $.create_issue.agent.pick_an_agent)}</span>
+          )}
+        </span>
+      }
+    >
+      {filteredAgents.length === 0 && filteredSquads.length === 0 ? (
+        query ? (
+          <PickerEmpty />
+        ) : (
+          <div className="px-2 py-1.5 text-xs text-muted-foreground">
+            {t(($) => $.create_issue.agent.no_agents)}
+          </div>
+        )
+      ) : (
+        <>
+          {filteredAgents.length > 0 && (
+            <PickerSection label={t(($) => $.create_issue.agent.agents_group)}>
+              {filteredAgents.map((a) => (
+                <PickerItem
+                  key={a.id}
+                  selected={actor?.type === "agent" && actor.id === a.id}
+                  onClick={() => {
+                    onPick({ type: "agent", id: a.id });
+                    setOpen(false);
+                  }}
+                >
+                  <ActorAvatar actorType="agent" actorId={a.id} size={18} />
+                  <span className="truncate">{a.name}</span>
+                </PickerItem>
+              ))}
+            </PickerSection>
+          )}
+          {filteredSquads.length > 0 && (
+            <PickerSection label={t(($) => $.create_issue.agent.squads_group)}>
+              {filteredSquads.map((s) => (
+                <PickerItem
+                  key={s.id}
+                  selected={actor?.type === "squad" && actor.id === s.id}
+                  onClick={() => {
+                    onPick({ type: "squad", id: s.id });
+                    setOpen(false);
+                  }}
+                >
+                  <ActorAvatar actorType="squad" actorId={s.id} size={18} />
+                  <span className="truncate">{s.name}</span>
+                </PickerItem>
+              ))}
+            </PickerSection>
+          )}
+        </>
+      )}
+    </PropertyPicker>
   );
 }

@@ -2,12 +2,12 @@
 
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { ChevronRight, Loader2, Square } from "lucide-react";
+import { ChevronRight, Loader2, RotateCcw, Square } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@multica/core/api";
 import { issueKeys } from "@multica/core/issues/queries";
 import type { AgentTask, TaskFailureReason } from "@multica/core/types";
-import { timeAgo } from "@multica/core/utils";
+import { useTimeAgo } from "../../i18n";
 import {
   Tooltip,
   TooltipContent,
@@ -17,6 +17,7 @@ import { ActorAvatar } from "../../common/actor-avatar";
 import { TranscriptButton } from "../../common/task-transcript";
 import { failureReasonLabel } from "../../agents/components/tabs/task-failure";
 import { useT } from "../../i18n";
+import { TerminateTaskConfirmDialog } from "./terminate-task-confirm-dialog";
 
 // Mask gradient that fades the trigger-summary text into transparency at
 // the right edge. Mirrors the pattern used by the desktop tab bar
@@ -165,7 +166,7 @@ export function ExecutionLogSection({ issueId }: ExecutionLogSectionProps) {
               {showPast && (
                 <div className="mt-0.5 space-y-0.5">
                   {pastTasks.map((task) => (
-                    <PastRow key={task.id} task={task} />
+                    <PastRow key={task.id} task={task} issueId={issueId} />
                   ))}
                 </div>
               )}
@@ -208,7 +209,7 @@ const STATUS_TONE: Record<AgentTask["status"], string> = {
 // Time anchor depends on status. Active rows want "Started 2m ago" /
 // "Queued 30s ago" — what's happening now. Past rows want "5m ago" — when
 // the verdict landed.
-function activeTimeText(task: AgentTask): string {
+function activeTimeText(task: AgentTask, timeAgo: (dateStr: string) => string): string {
   if (task.status === "running" && task.started_at) {
     return timeAgo(task.started_at);
   }
@@ -220,6 +221,8 @@ function activeTimeText(task: AgentTask): string {
 
 // ─── Active row ────────────────────────────────────────────────────────────
 
+import { stripMentionMarkdown } from "../utils/strip-mention-markdown";
+
 function useTriggerText(task: AgentTask): string {
   const { t } = useT("issues");
   const isRetry = !!task.parent_task_id;
@@ -229,7 +232,7 @@ function useTriggerText(task: AgentTask): string {
       : t(($) => $.execution_log.trigger_retry_prefix)
     : "";
 
-  if (task.trigger_summary) return retryPrefix + task.trigger_summary;
+  if (task.trigger_summary) return retryPrefix + stripMentionMarkdown(task.trigger_summary);
   if (isRetry) {
     return task.attempt && task.attempt > 1
       ? t(($) => $.execution_log.trigger_retry_attempt, { attempt: task.attempt })
@@ -254,11 +257,13 @@ function useStatusLabel(status: AgentTask["status"]): string {
 
 function ActiveRow({ task, issueId }: { task: AgentTask; issueId: string }) {
   const { t } = useT("issues");
+  const timeAgo = useTimeAgo();
   const [cancelling, setCancelling] = useState(false);
+  const [confirmOpen, setConfirmOpen] = useState(false);
   const tone = STATUS_TONE[task.status];
   const label = useStatusLabel(task.status);
   const trigger = useTriggerText(task);
-  const time = activeTimeText(task);
+  const time = activeTimeText(task, timeAgo);
 
   // Transcript only meaningful once messages exist — pure-queued tasks
   // have nothing to show yet.
@@ -273,6 +278,11 @@ function ActiveRow({ task, issueId }: { task: AgentTask; issueId: string }) {
       toast.error(e instanceof Error ? e.message : t(($) => $.execution_log.cancel_failed));
       setCancelling(false);
     }
+  };
+
+  const requestCancel = () => {
+    if (cancelling) return;
+    setConfirmOpen(true);
   };
 
   return (
@@ -298,7 +308,7 @@ function ActiveRow({ task, issueId }: { task: AgentTask; issueId: string }) {
             render={
               <button
                 type="button"
-                onClick={handleCancel}
+                onClick={requestCancel}
                 disabled={cancelling}
                 aria-label={t(($) => $.execution_log.cancel_task_aria)}
               />
@@ -314,14 +324,22 @@ function ActiveRow({ task, issueId }: { task: AgentTask; issueId: string }) {
           <TooltipContent>{t(($) => $.execution_log.cancel_task_tooltip)}</TooltipContent>
         </Tooltip>
       </RowActions>
+      <TerminateTaskConfirmDialog
+        open={confirmOpen}
+        onOpenChange={setConfirmOpen}
+        onConfirm={() => void handleCancel()}
+        showRunningNote={task.status === "running" || task.status === "dispatched"}
+      />
     </RowShell>
   );
 }
 
 // ─── Past row ──────────────────────────────────────────────────────────────
 
-function PastRow({ task }: { task: AgentTask }) {
+function PastRow({ task, issueId }: { task: AgentTask; issueId: string }) {
   const { t } = useT("issues");
+  const timeAgo = useTimeAgo();
+  const [retrying, setRetrying] = useState(false);
   const tone = STATUS_TONE[task.status];
   const label = useStatusLabel(task.status);
   const trigger = useTriggerText(task);
@@ -330,6 +348,28 @@ function PastRow({ task }: { task: AgentTask }) {
     task.status === "failed" && task.failure_reason
       ? failureReasonLabel[task.failure_reason as TaskFailureReason]
       : null;
+
+  // Retry only makes sense for terminal-but-not-success rows. Passing
+  // task.id targets this specific row's agent — without it, the rerun
+  // endpoint would fall back to the issue's current assignee and the
+  // wrong agent would fire on rows whose agent has since been displaced
+  // (e.g. reassignment, squad worker, or a one-off @-mention agent).
+  const canRetry = task.status === "failed" || task.status === "cancelled";
+
+  const handleRetry = async () => {
+    if (retrying) return;
+    setRetrying(true);
+    try {
+      await api.rerunIssue(issueId, task.id);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : t(($) => $.execution_log.retry_failed));
+    } finally {
+      // Reset on both success and failure: the past row stays mounted
+      // (its task.id is unchanged), so leaving `retrying` true on success
+      // would pin the button as a permanent spinner.
+      setRetrying(false);
+    }
+  };
 
   return (
     <RowShell task={task}>
@@ -340,6 +380,28 @@ function PastRow({ task }: { task: AgentTask }) {
       </span>
       <RowActions>
         <TranscriptButton task={task} agentName="" title={t(($) => $.execution_log.transcript_tooltip)} />
+        {canRetry && (
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <button
+                  type="button"
+                  onClick={handleRetry}
+                  disabled={retrying}
+                  aria-label={t(($) => $.execution_log.retry_task_aria)}
+                />
+              }
+              className="flex items-center justify-center rounded p-1 text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {retrying ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <RotateCcw className="h-3.5 w-3.5" />
+              )}
+            </TooltipTrigger>
+            <TooltipContent>{t(($) => $.execution_log.retry_task_tooltip)}</TooltipContent>
+          </Tooltip>
+        )}
       </RowActions>
     </RowShell>
   );

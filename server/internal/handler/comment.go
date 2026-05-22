@@ -12,23 +12,27 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/logger"
 	"github.com/multica-ai/multica/server/internal/mention"
+	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
 type CommentResponse struct {
-	ID          string               `json:"id"`
-	IssueID     string               `json:"issue_id"`
-	AuthorType  string               `json:"author_type"`
-	AuthorID    string               `json:"author_id"`
-	Content     string               `json:"content"`
-	Type        string               `json:"type"`
-	ParentID    *string              `json:"parent_id"`
-	CreatedAt   string               `json:"created_at"`
-	UpdatedAt   string               `json:"updated_at"`
-	Reactions   []ReactionResponse   `json:"reactions"`
-	Attachments []AttachmentResponse `json:"attachments"`
+	ID             string               `json:"id"`
+	IssueID        string               `json:"issue_id"`
+	AuthorType     string               `json:"author_type"`
+	AuthorID       string               `json:"author_id"`
+	Content        string               `json:"content"`
+	Type           string               `json:"type"`
+	ParentID       *string              `json:"parent_id"`
+	CreatedAt      string               `json:"created_at"`
+	UpdatedAt      string               `json:"updated_at"`
+	ResolvedAt     *string              `json:"resolved_at"`
+	ResolvedByType *string              `json:"resolved_by_type"`
+	ResolvedByID   *string              `json:"resolved_by_id"`
+	Reactions      []ReactionResponse   `json:"reactions"`
+	Attachments    []AttachmentResponse `json:"attachments"`
 }
 
 func commentToResponse(c db.Comment, reactions []ReactionResponse, attachments []AttachmentResponse) CommentResponse {
@@ -39,20 +43,83 @@ func commentToResponse(c db.Comment, reactions []ReactionResponse, attachments [
 		attachments = []AttachmentResponse{}
 	}
 	return CommentResponse{
-		ID:          uuidToString(c.ID),
-		IssueID:     uuidToString(c.IssueID),
-		AuthorType:  c.AuthorType,
-		AuthorID:    uuidToString(c.AuthorID),
-		Content:     c.Content,
-		Type:        c.Type,
-		ParentID:    uuidToPtr(c.ParentID),
-		CreatedAt:   timestampToString(c.CreatedAt),
-		UpdatedAt:   timestampToString(c.UpdatedAt),
-		Reactions:   reactions,
-		Attachments: attachments,
+		ID:             uuidToString(c.ID),
+		IssueID:        uuidToString(c.IssueID),
+		AuthorType:     c.AuthorType,
+		AuthorID:       uuidToString(c.AuthorID),
+		Content:        c.Content,
+		Type:           c.Type,
+		ParentID:       uuidToPtr(c.ParentID),
+		CreatedAt:      timestampToString(c.CreatedAt),
+		UpdatedAt:      timestampToString(c.UpdatedAt),
+		ResolvedAt:     timestampToPtr(c.ResolvedAt),
+		ResolvedByType: textToPtr(c.ResolvedByType),
+		ResolvedByID:   uuidToPtr(c.ResolvedByID),
+		Reactions:      reactions,
+		Attachments:    attachments,
 	}
 }
 
+// commentHardCap bounds the comments returned per issue. Sized as a defensive
+// safety net rather than a UX paging window: prod p99 is ~30 comments and
+// the all-time max observed is ~1.1k, so 2000 leaves ~2x headroom while still
+// preventing a runaway response if some user manages to accumulate a wild
+// number of rows on a single issue.
+const commentHardCap = 2000
+
+// ListComments returns comments for an issue. The default behaviour is
+// unchanged — full chronological dump capped at commentHardCap — so existing
+// callers and the desktop UI keep working as-is. Four optional query params
+// give agent-style readers a thread-aware view that scales to long issues
+// without dragging every prior comment into context:
+//
+//   - thread=<comment-uuid> — return the root of the thread containing this
+//     comment plus every descendant. The anchor may be a root or any reply;
+//     the server walks up to the root via a recursive CTE, so callers do not
+//     need to know whether the id they have is a root.
+//   - tail=<N> — only valid with thread. Cap the reply count at the N most
+//     recent replies (per (created_at, id)). The thread root is always
+//     returned, even when N=0, so the reader keeps the "what is this thread
+//     about" context. Without tail, thread returns the entire thread (the
+//     pre-MUL-2421 behavior).
+//   - recent=<N> — return the N most recently active threads (root + every
+//     descendant per thread). A thread's recency is MAX(created_at) across
+//     the whole subtree, so a stale-but-recently-replied thread ranks ahead
+//     of an active-but-quiet one. Row-based "newest N comments" is
+//     deliberately NOT exposed — it surfaces unrelated thread tails and
+//     hides relevant history (#2340).
+//   - before=<RFC3339> + before-id=<uuid> — cursor. The pair's meaning is
+//     context-dependent so the flag surface stays small:
+//
+//   - with recent: a *thread* cursor — (last_activity_at, root_id) — and
+//     the next page returns threads strictly less recent.
+//   - with thread + tail: a *reply* cursor — (created_at, id) — and the
+//     next page returns replies in the same thread strictly older than
+//     that reply.
+//
+// Both values must be set together so the cursor can tie-break entries
+// landing in the same microsecond. The cursor for the next page is
+// emitted via the X-Multica-Next-Before / X-Multica-Next-Before-Id
+// response headers.
+//
+// Combination rules (kept narrow on purpose — Elon flagged the matrix risk):
+//
+//   - thread is exclusive with recent. Asking for "the most recent N within
+//     thread X" mixes two different navigation models and is rejected.
+//   - thread + before/before-id requires tail. Without tail, thread returns
+//     the entire thread and a cursor would be ignored — reject loudly so
+//     the documented "cursor scrolls within a tailed window" rule holds.
+//   - tail requires thread (it is a thread-scoped limit; outside of thread
+//     it has no defined behavior).
+//   - thread may combine with since (incremental polling of one thread),
+//     and the since filter is applied after the tail/cursor cut so the
+//     thread root is still emitted but stale rows drop out.
+//   - recent may combine with before/before-id (scroll older threads) and
+//     with since (recent activity in a window).
+//
+// The response body is always chronological (oldest → newest); under recent
+// that means threads are listed oldest-active first and the freshest thread
+// sits at the tail, closest to "now" in an agent prompt.
 func (h *Handler) ListComments(w http.ResponseWriter, r *http.Request) {
 	issueID := chi.URLParam(r, "id")
 	issue, ok := h.loadIssueForUser(w, r, issueID)
@@ -60,106 +127,458 @@ func (h *Handler) ListComments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse optional pagination query params.
 	q := r.URL.Query()
-	var limit, offset int32
-	var hasPagination bool
-	if v := q.Get("limit"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 {
-			writeError(w, http.StatusBadRequest, "invalid limit parameter")
-			return
-		}
-		limit = int32(n)
-		hasPagination = true
-	}
-	if v := q.Get("offset"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 0 {
-			writeError(w, http.StatusBadRequest, "invalid offset parameter")
-			return
-		}
-		offset = int32(n)
-		hasPagination = true
-	}
 
 	var sinceTime pgtype.Timestamptz
 	if v := q.Get("since"); v != "" {
-		t, err := time.Parse(time.RFC3339, v)
+		t, err := time.Parse(time.RFC3339Nano, v)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid since parameter; expected RFC3339 format")
-			return
+			// Fall back to RFC3339 for backwards-compat with the original CLI.
+			t, err = time.Parse(time.RFC3339, v)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid since parameter; expected RFC3339 format")
+				return
+			}
 		}
 		sinceTime = pgtype.Timestamptz{Time: t, Valid: true}
 	}
 
-	var comments []db.Comment
-	var err error
+	threadStr := q.Get("thread")
+	recentStr := q.Get("recent")
+	tailStr := q.Get("tail")
+	beforeTimeStr := q.Get("before")
+	beforeIDStr := q.Get("before_id")
+	if beforeIDStr == "" {
+		// Accept hyphenated alias to match CLI flag convention.
+		beforeIDStr = q.Get("before-id")
+	}
 
-	// When neither limit nor offset is specified, default to the most recent
-	// 50 comments. The previous behavior returned every comment unbounded,
-	// which let an agent or browser call accidentally pull thousands of rows
-	// (see issue #1968). Callers that want everything must opt in with a
-	// large explicit --limit; a 100-cap on the server side stays in place via
-	// the timeline endpoint, but this endpoint is used by humans + the CLI
-	// where the cap is the documented 50 default.
-	if !hasPagination {
-		limit = 50
-		hasPagination = true
+	// --- combination validation ----------------------------------------
+	if threadStr != "" && recentStr != "" {
+		writeError(w, http.StatusBadRequest, "thread and recent are mutually exclusive")
+		return
 	}
-	switch {
-	case sinceTime.Valid:
-		if limit == 0 {
-			limit = 50
-		}
-		comments, err = h.Queries.ListCommentsSincePaginated(r.Context(), db.ListCommentsSincePaginatedParams{
-			IssueID:     issue.ID,
-			WorkspaceID: issue.WorkspaceID,
-			CreatedAt:   sinceTime,
-			Limit:       limit,
-			Offset:      offset,
-		})
-	default:
-		if limit == 0 {
-			limit = 50
-		}
-		comments, err = h.Queries.ListCommentsPaginated(r.Context(), db.ListCommentsPaginatedParams{
-			IssueID:     issue.ID,
-			WorkspaceID: issue.WorkspaceID,
-			Limit:       limit,
-			Offset:      offset,
-		})
+	if tailStr != "" && threadStr == "" {
+		writeError(w, http.StatusBadRequest, "tail requires thread (it is a thread-scoped limit)")
+		return
 	}
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to list comments")
+	if (beforeTimeStr == "") != (beforeIDStr == "") {
+		writeError(w, http.StatusBadRequest, "before and before_id must be set together (composite cursor)")
+		return
+	}
+	// Cursor needs either a recent window (thread cursor) or a tailed thread
+	// (reply cursor). A bare cursor would otherwise fall through to the
+	// default / since path — returning a full timeline that the caller did
+	// not ask for. Reject loudly so the API surface matches the documented
+	// semantics.
+	if beforeTimeStr != "" && recentStr == "" && (threadStr == "" || tailStr == "") {
+		writeError(w, http.StatusBadRequest, "before / before_id require recent (thread cursor) or thread + tail (reply cursor)")
 		return
 	}
 
-	commentIDs := make([]pgtype.UUID, len(comments))
-	for i, c := range comments {
+	// --- parse cursor / recent ----------------------------------------
+	var beforeCursor pgtype.Timestamptz
+	var beforeUUID pgtype.UUID
+	hasCursor := false
+	if beforeTimeStr != "" {
+		t, err := time.Parse(time.RFC3339Nano, beforeTimeStr)
+		if err != nil {
+			t, err = time.Parse(time.RFC3339, beforeTimeStr)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid before parameter; expected RFC3339 format")
+				return
+			}
+		}
+		beforeCursor = pgtype.Timestamptz{Time: t, Valid: true}
+		uuid, perr := util.ParseUUID(beforeIDStr)
+		if perr != nil {
+			writeError(w, http.StatusBadRequest, "invalid before_id parameter; expected UUID")
+			return
+		}
+		beforeUUID = uuid
+		hasCursor = true
+	}
+
+	recentN := 0
+	if recentStr != "" {
+		n, err := strconv.Atoi(recentStr)
+		if err != nil || n <= 0 {
+			writeError(w, http.StatusBadRequest, "invalid recent parameter; expected positive integer")
+			return
+		}
+		if n > commentHardCap {
+			n = commentHardCap
+		}
+		recentN = n
+	}
+
+	// tail=0 is allowed (returns root only — useful for "what is this thread
+	// about" lookups without dragging any replies into context). Negative
+	// values are rejected because they'd round-trip to LIMIT -N which
+	// PostgreSQL flags as a syntax error.
+	threadTail := -1
+	threadTailSet := false
+	if tailStr != "" {
+		n, err := strconv.Atoi(tailStr)
+		if err != nil || n < 0 {
+			writeError(w, http.StatusBadRequest, "invalid tail parameter; expected non-negative integer")
+			return
+		}
+		if n > commentHardCap {
+			n = commentHardCap
+		}
+		threadTail = n
+		threadTailSet = true
+	}
+
+	result, err := h.fetchCommentsForList(r.Context(), fetchCommentsArgs{
+		Issue:         issue,
+		Since:         sinceTime,
+		ThreadAnchor:  threadStr,
+		ThreadTail:    threadTail,
+		ThreadTailSet: threadTailSet,
+		RecentN:       recentN,
+		HasCursor:     hasCursor,
+		BeforeAt:      beforeCursor,
+		BeforeID:      beforeUUID,
+	})
+	if err != nil {
+		switch err {
+		case errCommentThreadNotFound:
+			writeError(w, http.StatusNotFound, "thread anchor not found in this issue")
+			return
+		case errCommentThreadBadID:
+			writeError(w, http.StatusBadRequest, "invalid thread parameter; expected UUID")
+			return
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to list comments")
+			return
+		}
+	}
+
+	commentIDs := make([]pgtype.UUID, len(result.Comments))
+	for i, c := range result.Comments {
 		commentIDs[i] = c.ID
 	}
 	grouped := h.groupReactions(r, commentIDs)
 	groupedAtt := h.groupAttachments(r, commentIDs)
 
-	resp := make([]CommentResponse, len(comments))
-	for i, c := range comments {
+	resp := make([]CommentResponse, len(result.Comments))
+	for i, c := range result.Comments {
 		cid := uuidToString(c.ID)
 		resp[i] = commentToResponse(c, grouped[cid], groupedAtt[cid])
 	}
 
-	// Include total count in response header when paginating.
-	if hasPagination {
-		total, countErr := h.Queries.CountComments(r.Context(), db.CountCommentsParams{
-			IssueID:     issue.ID,
-			WorkspaceID: issue.WorkspaceID,
-		})
-		if countErr == nil {
-			w.Header().Set("X-Total-Count", strconv.FormatInt(total, 10))
-		}
+	// Emit the next cursor as response headers when the page is likely not
+	// the last one. The cursor's meaning is context-dependent: under recent
+	// it points at the oldest thread in the page (next page = older threads);
+	// under thread + tail it points at the oldest reply in the page (next
+	// page = older replies in the same thread). Headers stay out of the JSON
+	// body so the default flat-array response shape — which the desktop UI
+	// and existing callers depend on — is unchanged.
+	if result.NextBefore != "" && result.NextBeforeID != "" {
+		w.Header().Set("X-Multica-Next-Before", result.NextBefore)
+		w.Header().Set("X-Multica-Next-Before-Id", result.NextBeforeID)
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// fetchCommentsArgs bundles the parsed query params so fetchCommentsForList
+// stays readable. Sentinel errors below let the caller turn DB-layer outcomes
+// into the right HTTP status without leaking SQL details.
+//
+// ThreadTail is split into a value + a "set" flag because tail=0 is a
+// meaningful caller intent (return just the root). A bare int would collapse
+// "user did not pass --tail" and "user passed --tail 0" into the same state,
+// which would silently downgrade the latter to the full-thread path.
+type fetchCommentsArgs struct {
+	Issue         db.Issue
+	Since         pgtype.Timestamptz
+	ThreadAnchor  string
+	ThreadTail    int
+	ThreadTailSet bool
+	RecentN       int
+	HasCursor     bool
+	BeforeAt      pgtype.Timestamptz
+	BeforeID      pgtype.UUID
+}
+
+// fetchCommentsResult carries both the materialised comments and (for the
+// recent/thread-grouped path) the cursor to use for the next page. Cursor
+// fields are empty strings when there is no next page or the path does not
+// support cursors.
+type fetchCommentsResult struct {
+	Comments     []db.Comment
+	NextBefore   string
+	NextBeforeID string
+}
+
+var (
+	errCommentThreadNotFound = &commentFetchError{"thread anchor not found"}
+	errCommentThreadBadID    = &commentFetchError{"invalid thread anchor id"}
+)
+
+type commentFetchError struct{ msg string }
+
+func (e *commentFetchError) Error() string { return e.msg }
+
+func (h *Handler) fetchCommentsForList(ctx context.Context, args fetchCommentsArgs) (fetchCommentsResult, error) {
+	issue := args.Issue
+
+	// Thread-scoped read. Server resolves the anchor → root via recursive
+	// CTE, so we don't have to assume two-layer flat threads here.
+	if args.ThreadAnchor != "" {
+		anchor, err := util.ParseUUID(args.ThreadAnchor)
+		if err != nil {
+			return fetchCommentsResult{}, errCommentThreadBadID
+		}
+		// Tailed path: paged query that returns root + the @reply_limit
+		// most recent replies (per (created_at, id)). The thread root is
+		// always returned, so a reader can land on a long thread without
+		// dragging hundreds of replies into context. The reply-internal
+		// cursor (--before / --before-id under --thread + --tail) scrolls
+		// to older replies inside the same thread.
+		if args.ThreadTailSet {
+			// Probe for has-more by asking the SQL for one extra reply
+			// beyond what the caller wants. If we get back >tail replies
+			// there is at least one older reply still on disk; if we get
+			// back ≤tail the page is the tail of the thread and there is
+			// nothing older to scroll to (so we must NOT emit a cursor —
+			// otherwise the next page is wasted round-trip that returns
+			// just the root). This is the exact-boundary fix called out
+			// in the MUL-2421 review.
+			rows, err := h.Queries.ListThreadCommentsForIssuePaged(ctx, db.ListThreadCommentsForIssuePagedParams{
+				AnchorID:    anchor,
+				IssueID:     issue.ID,
+				WorkspaceID: issue.WorkspaceID,
+				HasCursor:   args.HasCursor,
+				BeforeAt:    args.BeforeAt,
+				BeforeID:    args.BeforeID,
+				ReplyLimit:  int32(args.ThreadTail) + 1,
+			})
+			if err != nil {
+				return fetchCommentsResult{}, err
+			}
+			if len(rows) == 0 {
+				return fetchCommentsResult{}, errCommentThreadNotFound
+			}
+			// Split the result into root + replies (ASC order preserved).
+			// Root is identified by parent_id IS NULL and is always
+			// present in the SQL output; we keep it out of the cursor /
+			// tail-trim logic so the user always sees thread context.
+			var rootComment *db.Comment
+			replies := make([]db.Comment, 0, len(rows))
+			for _, r := range rows {
+				c := db.Comment{
+					ID:             r.ID,
+					IssueID:        r.IssueID,
+					AuthorType:     r.AuthorType,
+					AuthorID:       r.AuthorID,
+					Content:        r.Content,
+					Type:           r.Type,
+					CreatedAt:      r.CreatedAt,
+					UpdatedAt:      r.UpdatedAt,
+					ParentID:       r.ParentID,
+					WorkspaceID:    r.WorkspaceID,
+					ResolvedAt:     r.ResolvedAt,
+					ResolvedByType: r.ResolvedByType,
+					ResolvedByID:   r.ResolvedByID,
+				}
+				if !r.ParentID.Valid {
+					root := c
+					rootComment = &root
+					continue
+				}
+				replies = append(replies, c)
+			}
+			// Trim the probe overflow back to the caller's tail. The SQL
+			// emits ASC, so the extra row is the oldest reply — dropping
+			// it from the head is what aligns "newest N" with the user's
+			// request.
+			hasMore := len(replies) > args.ThreadTail
+			if hasMore {
+				replies = replies[1:]
+			}
+			out := make([]db.Comment, 0, len(replies)+1)
+			if rootComment != nil {
+				out = append(out, *rootComment)
+			}
+			for _, r := range replies {
+				// since drops stale rows AFTER the tail / cursor cut.
+				// The root is exempt (already appended above): a reader
+				// who set --since to skip already-seen replies still
+				// needs the root context if the page only contained
+				// the root.
+				if args.Since.Valid && !r.CreatedAt.Time.After(args.Since.Time) {
+					continue
+				}
+				out = append(out, r)
+			}
+			// Emit a reply cursor only when we proved an older reply
+			// exists (hasMore). On an exact-boundary page (replyCount
+			// == tail with no overflow) hasMore is false and the cursor
+			// stays empty.
+			//
+			// Additionally suppress the cursor when `since` is set and
+			// the oldest retained reply on this page is already <= since.
+			// The next page walks replies strictly older than that one,
+			// so every older reply has created_at strictly less — if the
+			// cursor target itself can't satisfy `> since`, no older
+			// reply can either, and continuing to paginate would only
+			// return root-only pages until the agent walks the entire
+			// pre-`since` history. This mirrors the head-thread guard on
+			// the recent + since path. Flagged by Elon's second review on
+			// MUL-2421.
+			res := fetchCommentsResult{Comments: out}
+			emitCursor := hasMore && len(replies) > 0
+			if emitCursor && args.Since.Valid && !replies[0].CreatedAt.Time.After(args.Since.Time) {
+				emitCursor = false
+			}
+			if emitCursor {
+				oldest := replies[0]
+				res.NextBefore = oldest.CreatedAt.Time.UTC().Format(time.RFC3339Nano)
+				res.NextBeforeID = uuidToString(oldest.ID)
+			}
+			return res, nil
+		}
+		rows, err := h.Queries.ListThreadCommentsForIssue(ctx, db.ListThreadCommentsForIssueParams{
+			AnchorID:    anchor,
+			IssueID:     issue.ID,
+			WorkspaceID: issue.WorkspaceID,
+			RowLimit:    commentHardCap,
+		})
+		if err != nil {
+			return fetchCommentsResult{}, err
+		}
+		if len(rows) == 0 {
+			return fetchCommentsResult{}, errCommentThreadNotFound
+		}
+		out := make([]db.Comment, 0, len(rows))
+		for _, r := range rows {
+			if args.Since.Valid && !r.CreatedAt.Time.After(args.Since.Time) {
+				continue
+			}
+			out = append(out, db.Comment{
+				ID:             r.ID,
+				IssueID:        r.IssueID,
+				AuthorType:     r.AuthorType,
+				AuthorID:       r.AuthorID,
+				Content:        r.Content,
+				Type:           r.Type,
+				CreatedAt:      r.CreatedAt,
+				UpdatedAt:      r.UpdatedAt,
+				ParentID:       r.ParentID,
+				WorkspaceID:    r.WorkspaceID,
+				ResolvedAt:     r.ResolvedAt,
+				ResolvedByType: r.ResolvedByType,
+				ResolvedByID:   r.ResolvedByID,
+			})
+		}
+		return fetchCommentsResult{Comments: out}, nil
+	}
+
+	// Thread-grouped recent read: N most recently active threads.
+	if args.RecentN > 0 {
+		rows, err := h.Queries.ListRecentThreadCommentsForIssue(ctx, db.ListRecentThreadCommentsForIssueParams{
+			IssueID:     issue.ID,
+			WorkspaceID: issue.WorkspaceID,
+			HasCursor:   args.HasCursor,
+			BeforeAt:    args.BeforeAt,
+			BeforeID:    args.BeforeID,
+			ThreadLimit: int32(args.RecentN),
+		})
+		if err != nil {
+			return fetchCommentsResult{}, err
+		}
+
+		// The SQL already orders rows by (last_activity_at ASC, root_id ASC,
+		// created_at ASC, id ASC), so the OLDEST-active thread sits at the
+		// head and the FRESHEST thread at the tail. Walk the rows once to:
+		//   1. Strip the thread-metadata columns down to db.Comment for the
+		//      caller (uniform shape across paths).
+		//   2. Count distinct threads in the page so we know whether a "next
+		//      older page" is likely to exist.
+		//   3. Capture the head thread's (last_activity_at, root_id) — that
+		//      is the cursor for the next page (next page = threads strictly
+		//      less recent than this one).
+		comments := make([]db.Comment, 0, len(rows))
+		var headRoot pgtype.UUID
+		var headLast pgtype.Timestamptz
+		seenRoot := map[string]struct{}{}
+		for _, r := range rows {
+			if !headRoot.Valid {
+				headRoot = r.ThreadRootID
+				headLast = r.ThreadLastActivityAt
+			}
+			seenRoot[uuidToString(r.ThreadRootID)] = struct{}{}
+			// Since filter on the recent path: drop comments older than
+			// `since`. Done in-memory so we keep the thread-grouped
+			// semantics from the query (don't pre-filter rows before the
+			// MAX(created_at) ranking — that would silently downgrade a
+			// thread whose most recent activity falls inside the window).
+			if args.Since.Valid && !r.CreatedAt.Time.After(args.Since.Time) {
+				continue
+			}
+			comments = append(comments, db.Comment{
+				ID:             r.ID,
+				IssueID:        r.IssueID,
+				AuthorType:     r.AuthorType,
+				AuthorID:       r.AuthorID,
+				Content:        r.Content,
+				Type:           r.Type,
+				CreatedAt:      r.CreatedAt,
+				UpdatedAt:      r.UpdatedAt,
+				ParentID:       r.ParentID,
+				WorkspaceID:    r.WorkspaceID,
+				ResolvedAt:     r.ResolvedAt,
+				ResolvedByType: r.ResolvedByType,
+				ResolvedByID:   r.ResolvedByID,
+			})
+		}
+
+		// Only emit a cursor when the page is full. Fewer threads than
+		// requested ⇒ the SELECT exhausted matching threads, so there is
+		// no older page to scroll to.
+		//
+		// Additionally suppress the cursor when `since` is set and the head
+		// thread's last_activity_at is already <= since. The pagination
+		// walks threads in strictly decreasing last_activity_at, so every
+		// older page has last_activity_at strictly less than the head's —
+		// if the head itself can't satisfy `> since`, no older thread can
+		// either. Predicating on the head (not on whether `comments` is
+		// empty) also catches the mixed case where this page keeps rows
+		// from fresher threads but the head thread is already past `since`.
+		// Flagged by Elon in #2787's second review (MUL-2340 nit).
+		out := fetchCommentsResult{Comments: comments}
+		emitCursor := len(seenRoot) >= args.RecentN && headRoot.Valid && headLast.Valid
+		if emitCursor && args.Since.Valid && !headLast.Time.After(args.Since.Time) {
+			emitCursor = false
+		}
+		if emitCursor {
+			out.NextBefore = headLast.Time.UTC().Format(time.RFC3339Nano)
+			out.NextBeforeID = uuidToString(headRoot)
+		}
+		return out, nil
+	}
+
+	// Default + since paths preserved verbatim (no behavioural change for
+	// existing callers).
+	if args.Since.Valid {
+		comments, err := h.Queries.ListCommentsSinceForIssue(ctx, db.ListCommentsSinceForIssueParams{
+			IssueID:     issue.ID,
+			WorkspaceID: issue.WorkspaceID,
+			CreatedAt:   args.Since,
+			Limit:       commentHardCap,
+		})
+		return fetchCommentsResult{Comments: comments}, err
+	}
+	comments, err := h.Queries.ListCommentsForIssue(ctx, db.ListCommentsForIssueParams{
+		IssueID:     issue.ID,
+		WorkspaceID: issue.WorkspaceID,
+		Limit:       commentHardCap,
+	})
+	return fetchCommentsResult{Comments: comments}, err
 }
 
 type CreateCommentRequest struct {
@@ -235,10 +654,23 @@ func (h *Handler) CreateComment(w http.ResponseWriter, r *http.Request) {
 			taskUUID, parseErr := util.ParseUUID(taskIDHeader)
 			if parseErr == nil {
 				task, err := h.Queries.GetAgentTask(r.Context(), taskUUID)
-				if err == nil && task.TriggerCommentID.Valid && uuidToString(task.IssueID) == uuidToString(issue.ID) {
-					if uuidToString(parentID) != uuidToString(task.TriggerCommentID) {
-						writeError(w, http.StatusConflict,
-							"parent_id must equal this task's trigger comment id ("+uuidToString(task.TriggerCommentID)+")")
+				if err == nil && task.IssueID.Valid && uuidToString(task.IssueID) == uuidToString(issue.ID) {
+					if task.TriggerCommentID.Valid {
+						if uuidToString(parentID) != uuidToString(task.TriggerCommentID) {
+							writeError(w, http.StatusConflict,
+								"parent_id must equal this task's trigger comment id ("+uuidToString(task.TriggerCommentID)+")")
+							return
+						}
+					}
+					noAction, checkErr := service.HasSquadLeaderNoActionEvaluationForTask(r.Context(), h.Queries, task)
+					if checkErr != nil {
+						slog.Warn("checking squad leader no_action evaluation failed", append(logger.RequestAttrs(r),
+							"error", checkErr,
+							"task_id", taskIDHeader,
+							"issue_id", issueID,
+						)...)
+					} else if noAction {
+						writeError(w, http.StatusConflict, "squad leader recorded no_action; comments are not allowed for this task")
 						return
 					}
 				}
@@ -287,6 +719,12 @@ func (h *Handler) CreateComment(w http.ResponseWriter, r *http.Request) {
 		"issue_status":        issue.Status,
 	})
 
+	// A reply in a resolved thread re-opens it. Done after CreateComment commits
+	// so the reply is visible regardless of the unresolve outcome. Shared with
+	// the agent task path (TaskService.createAgentComment) — both reply paths
+	// must keep the resolved root in sync.
+	h.TaskService.AutoUnresolveThreadOnReply(r.Context(), parentComment, uuidToString(issue.WorkspaceID), authorType, authorID)
+
 	// If the issue is assigned to an agent with on_comment trigger, enqueue a new task.
 	// Skip when the comment comes from the assigned agent itself to avoid loops.
 	// Also skip when the comment @mentions others but not the assignee agent —
@@ -304,6 +742,14 @@ func (h *Handler) CreateComment(w http.ResponseWriter, r *http.Request) {
 		if _, err := h.TaskService.EnqueueTaskForIssue(r.Context(), issue, comment.ID); err != nil {
 			slog.Warn("enqueue agent task on comment failed", "issue_id", issueID, "error", err)
 		}
+	}
+
+	// Squad trigger: if the issue is assigned to a squad, trigger the squad leader.
+	// Skip when the comment author is the leader (prevent internal loops), or
+	// when a member explicitly @mentions anyone (agent/member/squad/all) — that
+	// counts as deliberate routing and the leader stays out.
+	if h.shouldEnqueueSquadLeaderOnComment(r.Context(), issue, comment.Content, authorType, authorID) {
+		h.enqueueSquadLeaderTask(r.Context(), issue, comment.ID, authorType, authorID)
 	}
 
 	// Trigger @mentioned agents: parse agent mentions and enqueue tasks for each.
@@ -439,9 +885,13 @@ func shouldInheritParentMentions(parentComment *db.Comment, replyMentions []util
 // re-triggered by subsequent replies in the same thread — unless the reply
 // explicitly @mentions only non-agent entities (members, issues), which
 // signals the user is talking to other people and not the agent.
-// Skips self-mentions, agents with on_mention trigger disabled, and private
-// agents mentioned by non-owner members (only the agent owner or workspace
-// admin/owner can mention a private agent).
+// Skips agents with on_mention trigger disabled, and private agents mentioned
+// by non-owner members (only the agent owner or workspace admin/owner can
+// mention a private agent). Self-mentions are intentionally allowed so an
+// agent running in one issue can explicitly enqueue itself on another (e.g.
+// a child-issue run notifying the parent issue whose assignee is the same
+// agent); runaway loops are prevented by HasPendingTaskForIssueAndAgent
+// dedupe and the natural queued/dispatched coalescing of the task queue.
 // Note: no status gate here — @mention is an explicit action and should work
 // even on done/cancelled issues (the agent can reopen the issue if needed).
 func (h *Handler) enqueueMentionedAgentTasks(ctx context.Context, issue db.Issue, comment db.Comment, parentComment *db.Comment, authorType, authorID string) {
@@ -451,28 +901,71 @@ func (h *Handler) enqueueMentionedAgentTasks(ctx context.Context, issue db.Issue
 		mentions = util.ParseMentions(parentComment.Content)
 	}
 	for _, m := range mentions {
+		if m.Type == "squad" {
+			// @squad mention → trigger the squad's leader agent.
+			squadUUID := parseUUID(m.ID)
+			squad, err := h.Queries.GetSquadInWorkspace(ctx, db.GetSquadInWorkspaceParams{
+				ID:          squadUUID,
+				WorkspaceID: issue.WorkspaceID,
+			})
+			if err != nil {
+				continue
+			}
+			leaderID := squad.LeaderID
+			// Prevent self-trigger only when the agent's last activity on this
+			// issue was itself a leader task. An agent that holds both the
+			// leader and a worker role in the squad must still wake its
+			// leader role after posting a comment from its worker task.
+			if authorType == "agent" && authorID == uuidToString(leaderID) &&
+				h.lastTaskWasLeader(ctx, issue.ID, leaderID) {
+				continue
+			}
+			// Verify leader agent is ready (has runtime, not archived).
+			agent, err := h.Queries.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{
+				ID:          leaderID,
+				WorkspaceID: issue.WorkspaceID,
+			})
+			if err != nil || !agent.RuntimeID.Valid || agent.ArchivedAt.Valid {
+				continue
+			}
+			// Private-agent gate: prevent triggering a private leader via squad mention.
+			if !h.canAccessPrivateAgent(ctx, agent, authorType, authorID, wsID) {
+				continue
+			}
+			// Dedup: skip if leader already has a pending task for this issue.
+			hasPending, err := h.Queries.HasPendingTaskForIssueAndAgent(ctx, db.HasPendingTaskForIssueAndAgentParams{
+				IssueID: issue.ID,
+				AgentID: leaderID,
+			})
+			if err != nil || hasPending {
+				continue
+			}
+			if _, err := h.TaskService.EnqueueTaskForSquadLeader(ctx, issue, leaderID, comment.ID); err != nil {
+				slog.Warn("enqueue squad leader mention task failed", "issue_id", uuidToString(issue.ID), "squad_id", m.ID, "error", err)
+			}
+			continue
+		}
 		if m.Type != "agent" {
 			continue
 		}
-		// Prevent self-trigger: skip if the comment author is this agent.
-		if authorType == "agent" && authorID == m.ID {
-			continue
-		}
 		agentUUID := parseUUID(m.ID)
-		// Load the agent to check visibility, archive status, and trigger config.
-		agent, err := h.Queries.GetAgent(ctx, agentUUID)
+		// Load the agent scoped to the current issue's workspace. Using the
+		// bare GetAgent here would let a mention resolve to an agent in a
+		// different workspace, and the visibility check below would then be
+		// applied against the wrong workspace's roles (a workspace owner in
+		// THIS workspace would pass the gate for a private agent that lives
+		// in someone else's workspace).
+		agent, err := h.Queries.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{
+			ID:          agentUUID,
+			WorkspaceID: issue.WorkspaceID,
+		})
 		if err != nil || !agent.RuntimeID.Valid || agent.ArchivedAt.Valid {
 			continue
 		}
-		// Private agents can only be mentioned by the agent owner or workspace admin/owner.
-		if agent.Visibility == "private" && authorType == "member" {
-			isOwner := uuidToString(agent.OwnerID) == authorID
-			if !isOwner {
-				member, err := h.getWorkspaceMember(ctx, authorID, wsID)
-				if err != nil || !roleAllowed(member.Role, "owner", "admin") {
-					continue
-				}
-			}
+		// Private-agent gate (member→private requires allowed_principals;
+		// agent→agent always passes).
+		if !h.canAccessPrivateAgent(ctx, agent, authorType, authorID, wsID) {
+			continue
 		}
 		// Dedup: skip if this agent already has a pending task for this issue.
 		hasPending, err := h.Queries.HasPendingTaskForIssueAndAgent(ctx, db.HasPendingTaskForIssueAndAgentParams{
@@ -531,7 +1024,8 @@ func (h *Handler) UpdateComment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Content string `json:"content"`
+		Content       string   `json:"content"`
+		AttachmentIDs []string `json:"attachment_ids"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -539,6 +1033,11 @@ func (h *Handler) UpdateComment(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Content == "" {
 		writeError(w, http.StatusBadRequest, "content is required")
+		return
+	}
+
+	attachmentIDs, ok := parseUUIDSliceOrBadRequest(w, req.AttachmentIDs, "attachment_ids")
+	if !ok {
 		return
 	}
 
@@ -552,6 +1051,14 @@ func (h *Handler) UpdateComment(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("update comment failed", append(logger.RequestAttrs(r), "error", err, "comment_id", commentId)...)
 		writeError(w, http.StatusInternalServerError, "failed to update comment")
 		return
+	}
+
+	// Bind any newly uploaded attachments referenced in the edited content so
+	// they appear in the timeline's comment.attachments after refresh. Existing
+	// attachments already point at this comment via the upload flow; passing
+	// them again is a no-op at the SQL level.
+	if len(attachmentIDs) > 0 {
+		h.linkAttachmentsByIDs(r.Context(), comment.ID, existing.IssueID, attachmentIDs)
 	}
 
 	// Fetch reactions and attachments for the updated comment.
@@ -616,7 +1123,10 @@ func (h *Handler) DeleteComment(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("cancel tasks for deleted trigger comment failed", append(logger.RequestAttrs(r), "error", err, "comment_id", commentId)...)
 	}
 
-	if err := h.Queries.DeleteComment(r.Context(), comment.ID); err != nil {
+	if err := h.Queries.DeleteComment(r.Context(), db.DeleteCommentParams{
+		ID:          comment.ID,
+		WorkspaceID: comment.WorkspaceID,
+	}); err != nil {
 		slog.Warn("delete comment failed", append(logger.RequestAttrs(r), "error", err, "comment_id", commentId)...)
 		writeError(w, http.StatusInternalServerError, "failed to delete comment")
 		return
@@ -629,4 +1139,105 @@ func (h *Handler) DeleteComment(w http.ResponseWriter, r *http.Request) {
 		"issue_id":   uuidToString(comment.IssueID),
 	})
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// loadRootCommentForActor resolves a {commentId} URL param to a root comment in
+// the caller's workspace. Returns the comment, the workspace UUID, the actor
+// identity, and ok. Resolve / unresolve handlers share this scaffolding so the
+// "must be a root comment" rule lives in one place.
+func (h *Handler) loadRootCommentForActor(w http.ResponseWriter, r *http.Request) (db.Comment, string, string, string, bool) {
+	commentId := chi.URLParam(r, "commentId")
+	userID, ok := requireUserID(w, r)
+	if !ok {
+		return db.Comment{}, "", "", "", false
+	}
+	commentUUID, ok := parseUUIDOrBadRequest(w, commentId, "comment id")
+	if !ok {
+		return db.Comment{}, "", "", "", false
+	}
+	workspaceID := h.resolveWorkspaceID(r)
+	wsUUID, ok := parseUUIDOrBadRequest(w, workspaceID, "workspace id")
+	if !ok {
+		return db.Comment{}, "", "", "", false
+	}
+	if _, ok := h.workspaceMember(w, r, workspaceID); !ok {
+		return db.Comment{}, "", "", "", false
+	}
+	comment, err := h.Queries.GetCommentInWorkspace(r.Context(), db.GetCommentInWorkspaceParams{
+		ID:          commentUUID,
+		WorkspaceID: wsUUID,
+	})
+	if err != nil {
+		writeError(w, http.StatusNotFound, "comment not found")
+		return db.Comment{}, "", "", "", false
+	}
+	if comment.ParentID.Valid {
+		writeError(w, http.StatusBadRequest, "only root comments can be resolved")
+		return db.Comment{}, "", "", "", false
+	}
+	actorType, actorID := h.resolveActor(r, userID, workspaceID)
+	return comment, workspaceID, actorType, actorID, true
+}
+
+func (h *Handler) ResolveComment(w http.ResponseWriter, r *http.Request) {
+	comment, workspaceID, actorType, actorID, ok := h.loadRootCommentForActor(w, r)
+	if !ok {
+		return
+	}
+	wasResolved := comment.ResolvedAt.Valid
+
+	actorUUID, err := util.ParseUUID(actorID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid actor id")
+		return
+	}
+	updated, err := h.Queries.ResolveComment(r.Context(), db.ResolveCommentParams{
+		ID:             comment.ID,
+		ResolvedByType: pgtype.Text{String: actorType, Valid: true},
+		ResolvedByID:   actorUUID,
+	})
+	if err != nil {
+		slog.Warn("resolve comment failed", append(logger.RequestAttrs(r), "error", err, "comment_id", uuidToString(comment.ID))...)
+		writeError(w, http.StatusInternalServerError, "failed to resolve comment")
+		return
+	}
+
+	grouped := h.groupReactions(r, []pgtype.UUID{updated.ID})
+	groupedAtt := h.groupAttachments(r, []pgtype.UUID{updated.ID})
+	cid := uuidToString(updated.ID)
+	resp := commentToResponse(updated, grouped[cid], groupedAtt[cid])
+
+	// Suppress the event on a re-resolve no-op so consumers do not re-process
+	// an unchanged thread (notifications, log spam).
+	if !wasResolved {
+		slog.Info("comment resolved", append(logger.RequestAttrs(r), "comment_id", cid)...)
+		h.publish(protocol.EventCommentResolved, workspaceID, actorType, actorID, map[string]any{"comment": resp})
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (h *Handler) UnresolveComment(w http.ResponseWriter, r *http.Request) {
+	comment, workspaceID, actorType, actorID, ok := h.loadRootCommentForActor(w, r)
+	if !ok {
+		return
+	}
+	wasResolved := comment.ResolvedAt.Valid
+
+	updated, err := h.Queries.UnresolveComment(r.Context(), comment.ID)
+	if err != nil {
+		slog.Warn("unresolve comment failed", append(logger.RequestAttrs(r), "error", err, "comment_id", uuidToString(comment.ID))...)
+		writeError(w, http.StatusInternalServerError, "failed to unresolve comment")
+		return
+	}
+
+	grouped := h.groupReactions(r, []pgtype.UUID{updated.ID})
+	groupedAtt := h.groupAttachments(r, []pgtype.UUID{updated.ID})
+	cid := uuidToString(updated.ID)
+	resp := commentToResponse(updated, grouped[cid], groupedAtt[cid])
+
+	if wasResolved {
+		slog.Info("comment unresolved", append(logger.RequestAttrs(r), "comment_id", cid)...)
+		h.publish(protocol.EventCommentUnresolved, workspaceID, actorType, actorID, map[string]any{"comment": resp})
+	}
+	writeJSON(w, http.StatusOK, resp)
 }

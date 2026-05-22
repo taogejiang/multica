@@ -20,8 +20,8 @@ WHERE id = $1 AND workspace_id = $2;
 INSERT INTO agent (
     workspace_id, name, description, avatar_url, runtime_mode,
     runtime_config, runtime_id, visibility, max_concurrent_tasks, owner_id,
-    instructions, custom_env, custom_args, mcp_config, model
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+    instructions, custom_env, custom_args, mcp_config, model, thinking_level
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 RETURNING *;
 
 -- name: UpdateAgent :one
@@ -40,7 +40,16 @@ UPDATE agent SET
     custom_args = COALESCE(sqlc.narg('custom_args'), custom_args),
     mcp_config = COALESCE(sqlc.narg('mcp_config'), mcp_config),
     model = COALESCE(sqlc.narg('model'), model),
+    thinking_level = COALESCE(sqlc.narg('thinking_level'), thinking_level),
     updated_at = now()
+WHERE id = $1
+RETURNING *;
+
+-- name: ClearAgentThinkingLevel :one
+-- Explicit NULL-clear for thinking_level. COALESCE-based UpdateAgent cannot
+-- set the column back to NULL, so the API layer routes "user picked Default"
+-- through this dedicated query.
+UPDATE agent SET thinking_level = NULL, updated_at = now()
 WHERE id = $1
 RETURNING *;
 
@@ -52,6 +61,16 @@ RETURNING *;
 -- name: ArchiveAgent :one
 UPDATE agent SET archived_at = now(), archived_by = $2, updated_at = now()
 WHERE id = $1
+RETURNING *;
+
+-- name: ArchiveAgentsByRuntime :many
+-- Bulk-archives every active agent bound to any runtime in the given set.
+-- Used when revoking a leaving member's runtimes so agents pinned to those
+-- runtimes can no longer be assigned new work. Returns the affected rows so
+-- the caller can broadcast agent:archived per agent.
+UPDATE agent
+SET archived_at = now(), archived_by = @archived_by, updated_at = now()
+WHERE runtime_id = ANY(@runtime_ids::uuid[]) AND archived_at IS NULL
 RETURNING *;
 
 -- name: RestoreAgent :one
@@ -67,12 +86,13 @@ ORDER BY created_at DESC;
 -- name: CreateAgentTask :one
 INSERT INTO agent_task_queue (
     agent_id, runtime_id, issue_id, status, priority, trigger_comment_id,
-    trigger_summary, force_fresh_session
+    trigger_summary, force_fresh_session, is_leader_task
 )
 VALUES (
     $1, $2, $3, 'queued', $4, sqlc.narg(trigger_comment_id),
     sqlc.narg(trigger_summary),
-    COALESCE(sqlc.narg('force_fresh_session')::boolean, FALSE)
+    COALESCE(sqlc.narg('force_fresh_session')::boolean, FALSE),
+    COALESCE(sqlc.narg('is_leader_task')::boolean, FALSE)
 )
 RETURNING *;
 
@@ -97,19 +117,28 @@ WHERE id = $1 AND issue_id IS NULL;
 -- name: CreateRetryTask :one
 -- Clones a parent task into a fresh queued attempt. Carries forward the
 -- agent's resume context (session_id/work_dir) so the child can continue
--- the conversation when the backend supports it. attempt is incremented;
--- max_attempts and trigger_comment_id are inherited.
+-- the conversation when the backend supports it. Resume-unsafe failures are
+-- retried as fresh sessions so the child does not inherit a stuck agent
+-- conversation. Keep the CASE WHEN predicates in sync with
+-- resumeUnsafeFailureReason and the resume lookup blacklists. attempt is
+-- incremented; max_attempts, trigger_comment_id, and is_leader_task are
+-- inherited so the retried task keeps the same squad-role provenance as its
+-- parent and the self-trigger guard in shouldEnqueueSquadLeaderOnComment
+-- continues to recognise it as a leader task.
 INSERT INTO agent_task_queue (
     agent_id, runtime_id, issue_id, chat_session_id, autopilot_run_id,
     status, priority, trigger_comment_id, trigger_summary, context,
     session_id, work_dir,
-    attempt, max_attempts, parent_task_id
+    attempt, max_attempts, parent_task_id, force_fresh_session, is_leader_task
 )
 SELECT
     p.agent_id, p.runtime_id, p.issue_id, p.chat_session_id, p.autopilot_run_id,
     'queued', p.priority, p.trigger_comment_id, p.trigger_summary, p.context,
-    p.session_id, p.work_dir,
-    p.attempt + 1, p.max_attempts, p.id
+    CASE WHEN p.failure_reason IS NOT DISTINCT FROM 'codex_semantic_inactivity' THEN NULL ELSE p.session_id END,
+    CASE WHEN p.failure_reason IS NOT DISTINCT FROM 'codex_semantic_inactivity' THEN NULL ELSE p.work_dir END,
+    p.attempt + 1, p.max_attempts, p.id,
+    p.failure_reason IS NOT DISTINCT FROM 'codex_semantic_inactivity',
+    p.is_leader_task
 FROM agent_task_queue p
 WHERE p.id = $1
 RETURNING *;
@@ -210,6 +239,26 @@ WHERE id = (
 )
 RETURNING *;
 
+-- name: ReclaimStaleDispatchedTaskForRuntime :one
+-- Re-delivers a task whose previous claim likely succeeded server-side but
+-- whose response never reached the daemon. The task is still in `dispatched`
+-- with no `started_at`, so the daemon has not acknowledged it via StartTask.
+-- Refresh dispatched_at so the server-side dispatch timeout measures from the
+-- recovered delivery attempt.
+UPDATE agent_task_queue
+SET dispatched_at = now()
+WHERE id = (
+    SELECT atq.id FROM agent_task_queue atq
+    WHERE atq.runtime_id = $1
+      AND atq.status = 'dispatched'
+      AND atq.started_at IS NULL
+      AND atq.dispatched_at < now() - make_interval(secs => @claim_recovery_secs::double precision)
+    ORDER BY atq.priority DESC, atq.dispatched_at ASC
+    LIMIT 1
+    FOR UPDATE SKIP LOCKED
+)
+RETURNING *;
+
 -- name: StartAgentTask :one
 UPDATE agent_task_queue
 SET status = 'running', started_at = now()
@@ -224,23 +273,46 @@ RETURNING *;
 
 -- name: GetLastTaskSession :one
 -- Returns the session_id and work_dir from the most recent task for a given
--- (agent_id, issue_id) pair, used for session resumption. We accept both
--- 'completed' and 'failed' tasks: a failed task may have established a real
--- agent session before crashing (orphaned by a daemon restart, runtime offline,
--- or sweeper timeout), and the daemon pins the resume pointer mid-flight via
--- UpdateAgentTaskSession. Without this, an auto-retry / manual rerun of a
--- mid-run failure would silently start a fresh conversation and lose the
--- in-flight context — exactly what MUL-1128's B branch is meant to fix.
+-- (agent_id, issue_id) pair, used for session resumption on the auto-retry
+-- path. We accept both 'completed' and 'failed' tasks: a failed task may
+-- have established a real agent session before crashing (orphaned by a
+-- daemon restart, runtime offline, or sweeper timeout), and the daemon pins
+-- the resume pointer mid-flight via UpdateAgentTaskSession. Without this,
+-- an auto-retry of a mid-run failure would silently start a fresh
+-- conversation and lose the in-flight context — exactly what MUL-1128's B
+-- branch is meant to fix.
 --
--- Tasks that ended in a known "poisoned" terminal state are excluded so
--- a rerun does not inherit the bad session. The daemon classifies these
--- failures (iteration_limit, agent_fallback_message) when it detects the
--- agent emitted a fallback marker instead of a real result.
+-- Manual rerun (TaskService.RerunIssue) does NOT take this path: it sets
+-- force_fresh_session=true on the new task, and the daemon claim handler
+-- skips this lookup entirely. The user already judged the prior output bad;
+-- resuming the same conversation would replay a poisoned state.
+--
+-- Tasks that ended in a known "poisoned" terminal state are also excluded
+-- here so even auto-retry does not inherit the bad session. The daemon
+-- classifies these failures (iteration_limit, agent_fallback_message,
+-- api_invalid_request, codex_semantic_inactivity) when it detects either an
+-- agent fallback marker in the output, an upstream API 400 that means the
+-- conversation history itself is unprocessable (oversized image, malformed
+-- base64, etc.), or a Codex semantic inactivity timeout whose recorded
+-- session may replay the same stuck state.
+--
+-- The error-text ILIKE clause is defense-in-depth for the api_invalid_request
+-- shape: a legacy row tagged 'agent_error' (pre-MUL-1921), a deploy-window
+-- row that the old code wrote between migration and rollout, or a future
+-- error format that escapes the daemon classifier all still get filtered
+-- here as long as the canonical Anthropic 400 marker is present in the
+-- error text. Migration 079 backfills the failure_reason column itself,
+-- so observability stays accurate; this clause guarantees session resume
+-- never picks up a bad session even when failure_reason hasn't caught up.
 SELECT session_id, work_dir, runtime_id FROM agent_task_queue
 WHERE agent_id = $1 AND issue_id = $2
   AND (
     status = 'completed'
-    OR (status = 'failed' AND COALESCE(failure_reason, '') NOT IN ('iteration_limit', 'agent_fallback_message'))
+    OR (
+      status = 'failed'
+      AND COALESCE(failure_reason, '') NOT IN ('iteration_limit', 'agent_fallback_message', 'api_invalid_request', 'codex_semantic_inactivity')
+      AND NOT (COALESCE(error, '') ILIKE '%400%' AND COALESCE(error, '') ILIKE '%invalid_request_error%')
+    )
   )
   AND session_id IS NOT NULL
 ORDER BY COALESCE(completed_at, started_at, dispatched_at, created_at) DESC
@@ -299,6 +371,48 @@ WHERE (status = 'dispatched' AND dispatched_at < now() - make_interval(secs => @
    OR (status = 'running' AND started_at < now() - make_interval(secs => @running_timeout_secs::double precision))
 RETURNING *;
 
+-- name: ExpireStaleQueuedTasks :many
+-- Fails tasks that have been sitting in 'queued' for longer than the TTL.
+-- This is the cleanup arm of the MUL-1899 "queued backlog" fix: even with the
+-- new dispatch-time admission gate that refuses to enqueue when the runtime
+-- is offline, we still need to drain the historical 87k+ doomed rows and
+-- handle edge cases where a runtime goes offline AFTER a task is already
+-- queued (the admission check protects new enqueues, not in-flight queue
+-- depth).
+--
+-- Concurrency safety: the daemon's claim path may race with this sweeper to
+-- transition the same row out of 'queued'. We protect against that two
+-- ways:
+--   1. The CTE selects victims with FOR UPDATE SKIP LOCKED so a row that is
+--      currently being claimed (or otherwise locked) is skipped — no lock
+--      contention with the dispatch path, and we won't queue up behind it.
+--   2. The outer UPDATE re-checks status='queued' AND the TTL predicate at
+--      apply time. If a daemon claimed the row between selection and update
+--      (e.g. lock released after the claim transaction commits), the row is
+--      already 'dispatched'/'running' and the WHERE clause filters it out
+--      so we cannot clobber an in-flight task.
+-- Capped via LIMIT inside the CTE so a single sweep tick cannot monopolise
+-- the DB when the backlog is large — the sweeper drains the rest on
+-- subsequent ticks.
+WITH victims AS (
+    SELECT id FROM agent_task_queue
+    WHERE status = 'queued'
+      AND created_at < now() - make_interval(secs => @ttl_secs::double precision)
+    ORDER BY created_at ASC
+    LIMIT @max_per_tick::int
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE agent_task_queue t
+SET status = 'failed',
+    completed_at = now(),
+    error = 'task expired in queue',
+    failure_reason = 'queued_expired'
+FROM victims v
+WHERE t.id = v.id
+  AND t.status = 'queued'
+  AND t.created_at < now() - make_interval(secs => @ttl_secs::double precision)
+RETURNING t.*;
+
 -- name: CancelAgentTask :one
 UPDATE agent_task_queue
 SET status = 'cancelled', completed_at = now()
@@ -328,6 +442,18 @@ WHERE issue_id = $1 AND status IN ('queued', 'dispatched');
 SELECT count(*) > 0 AS has_pending FROM agent_task_queue
 WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued', 'dispatched');
 
+-- name: GetLatestTaskIsLeaderForIssueAndAgent :one
+-- Returns the is_leader_task flag of the agent's most recent task on this
+-- issue, or NULL if the agent has never had a task on this issue. Used by
+-- the squad-leader self-trigger guard to tell whether the agent's last
+-- activity on the issue was in the leader role or the worker role (an
+-- agent that holds both roles in a squad would otherwise be skipped by
+-- the role-blind authorID == leaderID check).
+SELECT is_leader_task FROM agent_task_queue
+WHERE issue_id = $1 AND agent_id = $2
+ORDER BY created_at DESC
+LIMIT 1;
+
 -- name: ListPendingTasksByRuntime :many
 SELECT * FROM agent_task_queue
 WHERE runtime_id = $1 AND status IN ('queued', 'dispatched')
@@ -347,8 +473,13 @@ WHERE runtime_id = $1 AND status = 'queued'
 ORDER BY priority DESC, created_at ASC;
 
 -- name: ListActiveTasksByIssue :many
+-- Backs the issue-detail "agent live" banner. Includes 'queued' so the
+-- banner shows up the moment a task is enqueued — not only after a runtime
+-- claims it. The queued window can be long when the runtime is offline or
+-- busy on a prior task, and a silent UI during that window looks like the
+-- platform never received the trigger.
 SELECT * FROM agent_task_queue
-WHERE issue_id = $1 AND status IN ('dispatched', 'running')
+WHERE issue_id = $1 AND status IN ('queued', 'dispatched', 'running')
 ORDER BY created_at DESC;
 
 -- name: GetWorkspaceAgentRunCounts :many

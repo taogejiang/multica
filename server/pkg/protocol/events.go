@@ -3,14 +3,17 @@ package protocol
 // Event types for WebSocket communication between server, web clients, and daemon.
 const (
 	// Issue events
-	EventIssueCreated = "issue:created"
-	EventIssueUpdated = "issue:updated"
-	EventIssueDeleted = "issue:deleted"
+	EventIssueCreated         = "issue:created"
+	EventIssueUpdated         = "issue:updated"
+	EventIssueDeleted         = "issue:deleted"
+	EventIssueMetadataChanged = "issue_metadata:changed"
 
 	// Comment events
 	EventCommentCreated       = "comment:created"
 	EventCommentUpdated       = "comment:updated"
 	EventCommentDeleted       = "comment:deleted"
+	EventCommentResolved      = "comment:resolved"
+	EventCommentUnresolved    = "comment:unresolved"
 	EventReactionAdded        = "reaction:added"
 	EventReactionRemoved      = "reaction:removed"
 	EventIssueReactionAdded   = "issue_reaction:added"
@@ -29,6 +32,7 @@ const (
 	// change" — not "every internal status flip".
 	EventTaskQueued    = "task:queued"    // ∅ → queued (enqueue / retry create)
 	EventTaskDispatch  = "task:dispatch"  // queued → dispatched (daemon claim)
+	EventTaskRunning   = "task:running"   // dispatched → running (daemon started)
 	EventTaskProgress  = "task:progress"
 	EventTaskCompleted = "task:completed" // running → completed
 	EventTaskFailed    = "task:failed"    // running → failed
@@ -68,6 +72,7 @@ const (
 	EventChatDone           = "chat:done"
 	EventChatSessionRead    = "chat:session_read"
 	EventChatSessionDeleted = "chat:session_deleted"
+	EventChatSessionUpdated = "chat:session_updated"
 
 	// Project events
 	EventProjectCreated         = "project:created"
@@ -100,9 +105,21 @@ const (
 	EventAutopilotRunStart = "autopilot:run_start"
 	EventAutopilotRunDone  = "autopilot:run_done"
 
+	// Squad events
+	EventSquadCreated = "squad:created"
+	EventSquadUpdated = "squad:updated"
+	EventSquadDeleted = "squad:deleted"
+
 	// Daemon events
 	EventDaemonHeartbeat     = "daemon:heartbeat"
 	EventDaemonHeartbeatAck  = "daemon:heartbeat_ack"
 	EventDaemonRegister      = "daemon:register"
 	EventDaemonTaskAvailable = "daemon:task_available"
+
+	// GitHub integration events
+	EventGitHubInstallationCreated = "github_installation:created"
+	EventGitHubInstallationDeleted = "github_installation:deleted"
+	EventPullRequestLinked         = "pull_request:linked"
+	EventPullRequestUpdated        = "pull_request:updated"
+	EventPullRequestUnlinked       = "pull_request:unlinked"
 )

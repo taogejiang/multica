@@ -1,8 +1,8 @@
 import type {
   RuntimeUsage,
   RuntimeUsageByAgent,
-  RuntimeUsageByHour,
 } from "@multica/core/types";
+import { getCustomPricing } from "@multica/core/runtimes/custom-pricing-store";
 
 // ---------------------------------------------------------------------------
 // Formatting helpers
@@ -114,21 +114,29 @@ export function formatTokens(n: number): string {
 // Cost estimation
 // ---------------------------------------------------------------------------
 
-// Pricing per million tokens (USD). Sourced from
-// https://platform.claude.com/docs/en/about-claude/pricing — keep in sync
-// when Anthropic releases new models or adjusts prices. cacheWrite reflects
-// the 5-minute cache TTL (1.25× input); the daemon reports
-// cache_creation_input_tokens without TTL metadata, so 5m is the safest /
-// cheapest assumption (matches the API default).
+// Pricing per million tokens (USD). Anthropic figures sourced from
+// https://platform.claude.com/docs/en/about-claude/pricing; OpenAI figures
+// from https://openai.com/api/pricing — keep in sync when providers release
+// new models or adjust prices.
 //
-// Iteration order matters: the resolver's startsWith() fallback walks this
-// object in insertion order, so MORE SPECIFIC keys (e.g. claude-sonnet-4-5)
-// must precede SHORTER prefixes (e.g. claude-sonnet-4) of the same family.
+// Anthropic's cacheWrite reflects the 5-minute cache TTL (1.25× input); the
+// daemon reports cache_creation_input_tokens without TTL metadata, so 5m is
+// the safest / cheapest assumption (matches the API default). OpenAI does
+// not bill cache writes separately (cached input is just discounted on
+// subsequent reads), so cacheWrite mirrors input there.
+//
+// The resolver matches exact keys after stripping a trailing date snapshot
+// (see `resolvePricing` below). It deliberately does NOT do startsWith
+// fallbacks: every catalog SKU needs its own row. That keeps unfamiliar
+// variants (`gpt-5.5-mini`, hypothetical `gpt-5.4-foo`) from silently
+// inheriting the price of a near-named relative; they surface in the
+// unmapped diagnostic instead. Mirror new entries in
+// `server/pkg/agent/models.go` so the catalog and pricing stay in sync.
 const MODEL_PRICING: Record<
   string,
   { input: number; output: number; cacheRead: number; cacheWrite: number }
 > = {
-  // -- Current generation (4.5+ — Opus dropped from 15/75 to 5/25 here) --
+  // -- Anthropic: current generation (4.5+ — Opus dropped from 15/75 to 5/25 here) --
   "claude-haiku-4-5":   { input: 1,    output: 5,    cacheRead: 0.10, cacheWrite: 1.25 },
   "claude-sonnet-4-5":  { input: 3,    output: 15,   cacheRead: 0.30, cacheWrite: 3.75 },
   "claude-sonnet-4-6":  { input: 3,    output: 15,   cacheRead: 0.30, cacheWrite: 3.75 },
@@ -136,37 +144,105 @@ const MODEL_PRICING: Record<
   "claude-opus-4-6":    { input: 5,    output: 25,   cacheRead: 0.50, cacheWrite: 6.25 },
   "claude-opus-4-7":    { input: 5,    output: 25,   cacheRead: 0.50, cacheWrite: 6.25 },
 
-  // -- Pre-4.5 Opus (legacy, still served at original price tier) --
+  // -- Anthropic: pre-4.5 Opus (legacy, still served at original price tier) --
   "claude-opus-4-1":    { input: 15,   output: 75,   cacheRead: 1.50, cacheWrite: 18.75 },
   "claude-opus-4":      { input: 15,   output: 75,   cacheRead: 1.50, cacheWrite: 18.75 },
 
-  // -- Sonnet 4.0 (deprecated; same price as the 4.x family) --
+  // -- Anthropic: Sonnet 4.0 (deprecated; same price as the 4.x family) --
   "claude-sonnet-4":    { input: 3,    output: 15,   cacheRead: 0.30, cacheWrite: 3.75 },
 
-  // -- Older Haiku tier (defensive entry for the rare runtime still on it) --
+  // -- Anthropic: older Haiku tier (defensive entry for the rare runtime still on it) --
   "claude-haiku-3-5":   { input: 0.80, output: 4,    cacheRead: 0.08, cacheWrite: 1.00 },
+
+  // -- OpenAI: dotted-minor Codex catalog SKUs. Each generation is priced
+  //    independently — no fallback to `gpt-5`. Entries track
+  //    `server/pkg/agent/models.go` (Codex provider list).
+  "gpt-5.5":            { input: 5,    output: 30,   cacheRead: 0.50,  cacheWrite: 5 },
+  "gpt-5.4-mini":       { input: 0.75, output: 4.50, cacheRead: 0.075, cacheWrite: 0.75 },
+  "gpt-5.4":            { input: 2.50, output: 15,   cacheRead: 0.25,  cacheWrite: 2.50 },
+  "gpt-5.3-codex":      { input: 1.75, output: 14,   cacheRead: 0.175, cacheWrite: 1.75 },
+
+  // -- OpenAI: GPT-5 family (Codex CLI's default is gpt-5-codex; -codex/-mini/-nano variants priced per OpenAI tiers) --
+  "gpt-5-codex":        { input: 1.25, output: 10,   cacheRead: 0.125, cacheWrite: 1.25 },
+  "gpt-5-mini":         { input: 0.25, output: 2,    cacheRead: 0.025, cacheWrite: 0.25 },
+  "gpt-5-nano":         { input: 0.05, output: 0.40, cacheRead: 0.005, cacheWrite: 0.05 },
+  "gpt-5":              { input: 1.25, output: 10,   cacheRead: 0.125, cacheWrite: 1.25 },
+
+  // -- OpenAI: o-series reasoning models --
+  "o3-mini":            { input: 1.10, output: 4.40, cacheRead: 0.55,  cacheWrite: 1.10 },
+  "o3":                 { input: 2,    output: 8,    cacheRead: 0.50,  cacheWrite: 2 },
+  "o4-mini":            { input: 1.10, output: 4.40, cacheRead: 0.275, cacheWrite: 1.10 },
+
+  // -- OpenAI: GPT-4o family (legacy, kept for runtimes still configured against it) --
+  "gpt-4o-mini":        { input: 0.15, output: 0.60, cacheRead: 0.075, cacheWrite: 0.15 },
+  "gpt-4o":             { input: 2.50, output: 10,   cacheRead: 1.25,  cacheWrite: 2.50 },
 };
 
-// Resolve a model string to its pricing tier. Two layers of fallback so the
-// daemon-reported model name doesn't have to match the keys exactly:
-//   1. Exact match.
-//   2. Strip a trailing date / "latest" tag (Claude Code typically reports
-//      `claude-sonnet-4-5-20250929` — the date is volatile, the family is
-//      what we price). Try exact match again on the stripped name.
-//   3. startsWith on either the raw or stripped name.
-// Anything that misses all three is genuinely unknown; we return undefined
-// so callers can distinguish "$0 spend" from "spent but model not priced".
+// Resolve a model string to its pricing tier. Exact match, with three
+// tolerances applied in order:
+//
+//  1. Provider-prefixed IDs (`anthropic/claude-opus-4.7` from openclaw /
+//     opencode) — the `<provider>/` segment is routing metadata, not part
+//     of the SKU, so we strip it before lookup.
+//  2. Anthropic dot↔dash normalization — Claude Code reports
+//     `claude-opus-4-7`, GitHub Copilot reports `claude-opus-4.7`. Same
+//     SKU, two transports. We canonicalize `claude-*` IDs to the dashed
+//     form Anthropic itself publishes. Scoped to `claude-*` because for
+//     OpenAI the separator IS semantic (`gpt-5.4` ≠ `gpt-5-4`).
+//  3. Trailing dated snapshots (`claude-sonnet-4-5-20250929`,
+//     `gpt-5-2025-08-07`) — the family is what we price, the date is
+//     volatile, so we strip a trailing date / "latest" tag.
+//
+// Anything still unmapped falls back to the user-supplied custom pricing
+// store. No startsWith fallback: variants like `gpt-5.5-mini` must have
+// their own row to be priced (otherwise they'd inherit `gpt-5.5`).
 function resolvePricing(model: string) {
   if (!model) return undefined;
-  if (MODEL_PRICING[model]) return MODEL_PRICING[model];
 
-  const stripped = model.replace(/-(20\d{6}|latest)$/, "");
-  if (stripped !== model && MODEL_PRICING[stripped]) return MODEL_PRICING[stripped];
-
-  for (const [key, p] of Object.entries(MODEL_PRICING)) {
-    if (model.startsWith(key) || stripped.startsWith(key)) return p;
+  for (const candidate of canonicalCandidates(model)) {
+    const hit = MODEL_PRICING[candidate];
+    if (hit) return hit;
+  }
+  for (const candidate of canonicalCandidates(model)) {
+    const hit = getCustomPricing(candidate);
+    if (hit) return hit;
   }
   return undefined;
+}
+
+// Generate the lookup candidates for a model string, in priority order:
+// the raw string first (preserves explicit user / catalog spellings),
+// then the canonicalized forms. Deduped so we don't repeat lookups.
+function canonicalCandidates(model: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const push = (s: string) => {
+    if (!s || seen.has(s)) return;
+    seen.add(s);
+    out.push(s);
+  };
+  const stripDate = (s: string) =>
+    s.replace(/-(20\d{2}-\d{2}-\d{2}|20\d{6}|latest)$/, "");
+  const stripProvider = (s: string) => {
+    const i = s.indexOf("/");
+    return i > 0 && /^[a-z][a-z0-9_-]*$/i.test(s.slice(0, i)) ? s.slice(i + 1) : s;
+  };
+  // Only Anthropic IDs are dot↔dash equivalent. OpenAI separators are
+  // semantic, so we leave `gpt-5.4` etc. alone.
+  const canonAnthropic = (s: string) =>
+    s.startsWith("claude-") ? s.replace(/\./g, "-") : s;
+
+  const raw = model;
+  const noProvider = stripProvider(raw);
+  const dashed = canonAnthropic(noProvider);
+
+  push(raw);
+  push(noProvider);
+  push(dashed);
+  push(stripDate(raw));
+  push(stripDate(noProvider));
+  push(stripDate(dashed));
+  return out;
 }
 
 // Cheap predicate for the empty-state diagnostic: which model strings in a
@@ -276,6 +352,37 @@ export interface ModelDistribution {
   cost: number;
 }
 
+export interface WeeklyTokenData {
+  weekStart: string;
+  weekEnd: string;
+  // X-axis tick — Monday of the week, e.g. "May 12".
+  label: string;
+  // Tooltip header — inclusive range, e.g. "May 12 – May 18".
+  rangeLabel: string;
+  // True when `weekEnd` is in the future (today is mid-week). Surface this
+  // in the chart so the bar can be drawn at reduced opacity / striped to
+  // signal "don't read this as a finished week".
+  partial: boolean;
+  daysCovered: number;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+export interface WeeklyCostStackData {
+  weekStart: string;
+  weekEnd: string;
+  label: string;
+  rangeLabel: string;
+  partial: boolean;
+  daysCovered: number;
+  input: number;
+  output: number;
+  cacheWrite: number;
+  total: number;
+}
+
 export function aggregateByDate(usage: RuntimeUsage[]): {
   dailyTokens: DailyTokenData[];
   dailyCost: DailyCostData[];
@@ -367,6 +474,210 @@ export function aggregateByDate(usage: RuntimeUsage[]): {
   return { dailyTokens, dailyCost, dailyCostStack, modelDist };
 }
 
+// Fold daily-grain rows into ISO calendar weeks (Mon–Sun). Reuses the same
+// 180-day cache the daily aggregation reads from — no extra request. The
+// latest week is flagged `partial` when today (in the runtime's tz) is
+// before Sunday, so the chart can render the in-progress bar at half
+// opacity instead of letting the user misread "this week" as a dip.
+//
+// `weekCount` pins the output to exactly that many trailing calendar weeks
+// ending at the week that contains today (in `tz`). Buckets are pre-zeroed,
+// so sparse data — including weeks with no usage — renders as empty bars
+// rather than disappearing. Rows whose week falls outside the window are
+// dropped; without this guard `.slice(-weekCount)` on a sparse 180-day
+// aggregate would surface old populated weeks instead of the empty
+// in-range buckets the user asked for (MUL-2382 weekly window scoping).
+// Accepts any row carrying `date` + token counts + the model needed for
+// pricing. Both `RuntimeUsage` (runtime detail) and `DashboardUsageDaily`
+// (workspace dashboard) match this shape — there's no behavioural difference,
+// just slightly different surrounding fields neither aggregator cares about.
+type WeeklyAggregable = Pick<
+  RuntimeUsage,
+  | "date"
+  | "model"
+  | "input_tokens"
+  | "output_tokens"
+  | "cache_read_tokens"
+  | "cache_write_tokens"
+>;
+
+export function aggregateByWeek(
+  usage: readonly WeeklyAggregable[],
+  tz: string,
+  weekCount: number,
+): {
+  weeklyTokens: WeeklyTokenData[];
+  weeklyCostStack: WeeklyCostStackData[];
+} {
+  const count = Math.max(1, Math.floor(weekCount));
+  const today = todayIso(tz);
+  const currentWeekStart = weekStartIso(today);
+  const firstWeekStart = addDaysIso(currentWeekStart, -(count - 1) * 7);
+
+  type TokenAgg = Omit<WeeklyTokenData, "label" | "rangeLabel" | "partial" | "daysCovered" | "weekEnd">;
+  const tokenMap = new Map<string, TokenAgg>();
+  const stackMap = new Map<string, { input: number; output: number; cacheWrite: number }>();
+
+  // Pre-seed every trailing calendar week in the window so sparse / empty
+  // weeks still render as zero bars instead of being dropped.
+  for (let i = 0; i < count; i++) {
+    const wkStart = addDaysIso(firstWeekStart, i * 7);
+    tokenMap.set(wkStart, {
+      weekStart: wkStart,
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+    });
+    stackMap.set(wkStart, { input: 0, output: 0, cacheWrite: 0 });
+  }
+
+  for (const u of usage) {
+    const wkStart = weekStartIso(u.date);
+    if (wkStart < firstWeekStart || wkStart > currentWeekStart) continue;
+    const tokens = tokenMap.get(wkStart);
+    if (!tokens) continue;
+    tokens.input += u.input_tokens;
+    tokens.output += u.output_tokens;
+    tokens.cacheRead += u.cache_read_tokens;
+    tokens.cacheWrite += u.cache_write_tokens;
+
+    const breakdown = estimateCostBreakdown(u);
+    const stack = stackMap.get(wkStart);
+    if (!stack) continue;
+    stack.input += breakdown.input;
+    stack.output += breakdown.output;
+    stack.cacheWrite += breakdown.cacheWrite;
+  }
+
+  const decorate = (weekStart: string) => {
+    const weekEnd = addDaysIso(weekStart, 6);
+    const partial = today < weekEnd;
+    // Inclusive count of how many days of this week have actually elapsed.
+    // Sits at 7 for closed weeks, 1..6 for the current week.
+    const elapsedDays = Math.min(
+      7,
+      Math.max(
+        1,
+        // Day index of `today` within [weekStart, weekEnd] + 1.
+        diffDaysIso(weekStart, today < weekStart ? weekStart : today < weekEnd ? today : weekEnd) + 1,
+      ),
+    );
+    return {
+      weekStart,
+      weekEnd,
+      label: formatShortDate(weekStart),
+      rangeLabel: `${formatShortDate(weekStart)} – ${formatShortDate(weekEnd)}`,
+      partial,
+      daysCovered: partial ? elapsedDays : 7,
+    };
+  };
+
+  const weeklyTokens: WeeklyTokenData[] = [...tokenMap.values()]
+    .sort((a, b) => a.weekStart.localeCompare(b.weekStart))
+    .map((t) => ({ ...t, ...decorate(t.weekStart) }));
+
+  const weeklyCostStack: WeeklyCostStackData[] = [...stackMap.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([weekStart, s]) => {
+      const round = (n: number) => Math.round(n * 100) / 100;
+      const input = round(s.input);
+      const output = round(s.output);
+      const cacheWrite = round(s.cacheWrite);
+      return {
+        ...decorate(weekStart),
+        input,
+        output,
+        cacheWrite,
+        total: round(input + output + cacheWrite),
+      };
+    });
+
+  return { weeklyTokens, weeklyCostStack };
+}
+
+// Slice a daily-grain usage series into the user's selected window AND the
+// immediately prior window of equal length. "Today" is read in the runtime's
+// timezone so the cutoff lands on the same calendar boundary the backend
+// used when bucketing rows — without this the browser/runtime tz gap could
+// shift the boundary by a day at the edges (#MUL-2382 sliceWindow tz bug).
+export function sliceWindow(
+  usage: readonly RuntimeUsage[],
+  days: number,
+  tz: string,
+): { filtered: RuntimeUsage[]; prevFiltered: RuntimeUsage[] } {
+  const today = todayIso(tz);
+  const isoCurrent = addDaysIso(today, -days);
+  const isoPrev = addDaysIso(today, -days * 2);
+  return {
+    filtered: usage.filter((u) => u.date >= isoCurrent),
+    prevFiltered: usage.filter(
+      (u) => u.date >= isoPrev && u.date < isoCurrent,
+    ),
+  };
+}
+
+function diffDaysIso(from: string, to: string): number {
+  const [y1, m1, d1] = from.split("-").map(Number);
+  const [y2, m2, d2] = to.split("-").map(Number);
+  const a = Date.UTC(y1 ?? 1970, (m1 ?? 1) - 1, d1 ?? 1);
+  const b = Date.UTC(y2 ?? 1970, (m2 ?? 1) - 1, d2 ?? 1);
+  return Math.round((b - a) / 86_400_000);
+}
+
+// ---------------------------------------------------------------------------
+// Calendar helpers — all date math runs on YYYY-MM-DD strings in the
+// runtime's IANA timezone. The backend already groups daily usage by
+// `start-of-day in runtime tz`, so we keep the entire frontend aggregation
+// on the same axis (Daily / Weekly) to avoid one-day drift when the browser
+// and runtime sit in different time zones.
+// ---------------------------------------------------------------------------
+
+// Today's calendar date (YYYY-MM-DD) in the given IANA timezone. `en-CA`
+// gives ISO-shaped output without us having to assemble Intl parts by hand.
+export function todayIso(tz: string): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+}
+
+// Pure date arithmetic on a YYYY-MM-DD string. Uses UTC under the hood so
+// DST transitions never shift the result by an hour and round to a
+// neighbouring day.
+export function addDaysIso(iso: string, days: number): string {
+  const [y, m, d] = iso.split("-").map(Number);
+  const dt = new Date(Date.UTC(y ?? 1970, (m ?? 1) - 1, d ?? 1));
+  dt.setUTCDate(dt.getUTCDate() + days);
+  return dt.toISOString().slice(0, 10);
+}
+
+// Monday-of-week as YYYY-MM-DD. ISO 8601 week-start, matching the heatmap
+// and the team's day-to-day "this week" mental model. Pure string math —
+// no `new Date()` reads — so it's stable under any host timezone.
+export function weekStartIso(iso: string): string {
+  const [y, m, d] = iso.split("-").map(Number);
+  const dt = new Date(Date.UTC(y ?? 1970, (m ?? 1) - 1, d ?? 1));
+  const day = dt.getUTCDay(); // 0 = Sun, 1 = Mon, ..., 6 = Sat
+  const offset = (day + 6) % 7; // distance back to Monday
+  dt.setUTCDate(dt.getUTCDate() - offset);
+  return dt.toISOString().slice(0, 10);
+}
+
+// "May 12" — short, locale-aware month/day for a YYYY-MM-DD string. Parsing
+// via UTC keeps the displayed day stable regardless of the browser's tz.
+export function formatShortDate(iso: string): string {
+  const [y, m, d] = iso.split("-").map(Number);
+  const dt = new Date(Date.UTC(y ?? 1970, (m ?? 1) - 1, d ?? 1));
+  return dt.toLocaleString("en", {
+    month: "short",
+    day: "numeric",
+    timeZone: "UTC",
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Cost-by-X aggregations
 //
@@ -419,32 +730,16 @@ export function aggregateCostByModel(rows: RuntimeUsage[]): CostByKey[] {
   return [...map.values()].sort((a, b) => b.cost - a.cost);
 }
 
-// Per-(hour, model) rows → 24 fixed buckets (0..23). Hours with no activity
-// stay in the list as empty rows so the bar chart axis stays continuous.
-export function aggregateCostByHour(rows: RuntimeUsageByHour[]): CostByKey[] {
-  const buckets = new Map<number, CostByKey>();
-  for (let h = 0; h < 24; h++) {
-    buckets.set(h, { key: String(h), tokens: 0, cost: 0, taskCount: 0 });
-  }
-  for (const r of rows) {
-    const entry = buckets.get(r.hour);
-    if (!entry) continue;
-    entry.tokens +=
-      r.input_tokens + r.output_tokens + r.cache_read_tokens + r.cache_write_tokens;
-    entry.cost += estimateCost(r);
-    entry.taskCount += r.task_count;
-  }
-  return [...buckets.values()];
-}
-
-// "Cost · 30D" KPI hint: percentage delta vs. the immediately prior window
-// of equal length. Returns null when there's no comparable prior data
-// (caller renders nothing rather than a misleading "+∞%").
 // Sum of estimated cost over the trailing window
 //   [today − offsetDays − daysBack, today − offsetDays).
 // `offsetDays = 0, daysBack = 7` → last 7 days.
 // `offsetDays = 7, daysBack = 7` → the 7 days *before* the last 7 (the
 // "previous" window for the runtime-list ↑/↓ delta).
+//
+// "Today" is read in `tz` (the viewer's timezone) so the cutoff lands on
+// the same calendar boundary the backend used when bucketing rows — the
+// rows arrive bucketed in the viewer's tz, so slicing them with the JS
+// engine's local tz would shift the window by a day at the edges.
 //
 // Walks the same daily-grain `RuntimeUsage` rows that `aggregateByDate` uses,
 // so the runtime-list cost stays consistent with the runtime-detail KPIs
@@ -452,15 +747,12 @@ export function aggregateCostByHour(rows: RuntimeUsageByHour[]): CostByKey[] {
 export function computeCostInWindow(
   rows: readonly RuntimeUsage[],
   daysBack: number,
+  tz: string,
   offsetDays: number = 0,
 ): number {
-  const now = new Date();
-  const end = new Date(now);
-  end.setDate(now.getDate() - offsetDays);
-  const start = new Date(now);
-  start.setDate(now.getDate() - offsetDays - daysBack);
-  const isoEnd = end.toISOString().slice(0, 10);
-  const isoStart = start.toISOString().slice(0, 10);
+  const today = todayIso(tz);
+  const isoEnd = addDaysIso(today, -offsetDays);
+  const isoStart = addDaysIso(today, -offsetDays - daysBack);
   let total = 0;
   for (const r of rows) {
     if (r.date >= isoStart && r.date < isoEnd) total += estimateCost(r);

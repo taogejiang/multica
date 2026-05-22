@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { act, render, screen } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { AgentRuntime } from "@multica/core/types";
 import { I18nProvider } from "@multica/core/i18n/react";
 import enCommon from "../../locales/en/common.json";
@@ -64,10 +65,15 @@ function setPicker(patch: Partial<typeof mocks.pickerState> = {}) {
 function renderStep() {
   const onNext = vi.fn();
   const onBack = vi.fn();
+  const qc = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
   render(
-    <I18nProvider locale="en" resources={TEST_RESOURCES}>
-      <StepRuntimeConnect wsId="ws_test" onNext={onNext} onBack={onBack} />
-    </I18nProvider>,
+    <QueryClientProvider client={qc}>
+      <I18nProvider locale="en" resources={TEST_RESOURCES}>
+        <StepRuntimeConnect wsId="ws_test" onNext={onNext} onBack={onBack} />
+      </I18nProvider>
+    </QueryClientProvider>,
   );
   return { onNext, onBack };
 }
@@ -98,7 +104,9 @@ describe("StepRuntimeConnect — onboarding_runtime_detected", () => {
     const [name, props] = mocks.captureEvent.mock.calls[0]!;
     expect(name).toBe("onboarding_runtime_detected");
     expect(props).toMatchObject({
-      source: "step3_desktop",
+      source: "onboarding",
+      surface: "step3_desktop",
+      workspace_id: "ws_test",
       outcome: "found",
       runtime_count: 1,
       online_count: 1,
@@ -154,7 +162,9 @@ describe("StepRuntimeConnect — onboarding_runtime_detected", () => {
     expect(mocks.captureEvent).toHaveBeenCalledTimes(1);
     const props = mocks.captureEvent.mock.calls[0]![1] as Record<string, unknown>;
     expect(props).toMatchObject({
-      source: "step3_desktop",
+      source: "onboarding",
+      surface: "step3_desktop",
+      workspace_id: "ws_test",
       outcome: "empty",
       runtime_count: 0,
       online_count: 0,
@@ -218,6 +228,8 @@ describe("StepRuntimeConnect — onboarding_runtime_detected", () => {
     // shell around the effect.
     setPicker({ runtimes: [] });
     renderStep();
-    expect(screen.getByText(/Looking for your tools/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/connecting this computer/i),
+    ).toBeInTheDocument();
   });
 });

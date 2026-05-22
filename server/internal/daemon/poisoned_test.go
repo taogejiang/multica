@@ -3,6 +3,8 @@ package daemon
 import (
 	"strings"
 	"testing"
+
+	"github.com/multica-ai/multica/server/pkg/agent"
 )
 
 func TestClassifyPoisonedOutput(t *testing.T) {
@@ -59,10 +61,10 @@ Detection markers under consideration:
 
 The implementation looks correct: the daemon classifies these as
 fallback output, persists a dedicated failure_reason, and the SQL
-filter excludes them from the resume lookup. Auto-retry of mid-flight
-orphans still keeps the resume contract because CreateRetryTask does
-not set force_fresh_session. Approving with a follow-up note about
-the matcher being too permissive on long outputs.`,
+filter excludes them from the resume lookup. Resume-safe auto-retry
+still keeps the resume contract, while poisoned sessions are filtered.
+Approving with a follow-up note about the matcher being too permissive
+on long outputs.`,
 			wantOK: false,
 		},
 		{
@@ -80,6 +82,139 @@ the matcher being too permissive on long outputs.`,
 			}
 			if ok && reason != tc.wantReason {
 				t.Fatalf("classifyPoisonedOutput(%q) reason=%q, want %q", tc.output, reason, tc.wantReason)
+			}
+		})
+	}
+}
+
+func TestClassifyPoisonedError(t *testing.T) {
+	cases := []struct {
+		name       string
+		errMsg     string
+		wantOK     bool
+		wantReason string
+	}{
+		{
+			// MUL-1921 reproducer: a markdown image in the issue
+			// description was downloaded as a 146-byte CDN auth-error
+			// XML, then surfaced to the LLM as a base64 PNG. The API
+			// rejected it and every follow-up task replayed the same
+			// poisoned conversation.
+			name:       "claude could not process image",
+			errMsg:     `API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Could not process image"},"request_id":"req_011CarVEtBLj95zD7i8xardY"}`,
+			wantOK:     true,
+			wantReason: FailureReasonAPIInvalidRequest,
+		},
+		{
+			name:       "prompt too long is also poisoning",
+			errMsg:     `API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 213000 tokens > 200000 maximum"}}`,
+			wantOK:     true,
+			wantReason: FailureReasonAPIInvalidRequest,
+		},
+		{
+			name:       "case insensitive",
+			errMsg:     `api error: 400 {"type":"INVALID_REQUEST_ERROR"}`,
+			wantOK:     true,
+			wantReason: FailureReasonAPIInvalidRequest,
+		},
+		{
+			// Rate-limit must NOT be classified as poisoning — those
+			// recover on retry and we want session resume to keep the
+			// in-flight conversation memory.
+			name:   "429 rate limit is transient",
+			errMsg: `API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"Number of request tokens has exceeded your per-minute rate limit"}}`,
+			wantOK: false,
+		},
+		{
+			name:   "5xx overloaded is transient",
+			errMsg: `API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`,
+			wantOK: false,
+		},
+		{
+			// 401/403 mean the daemon's credentials are bad; resuming
+			// the session won't fix it but the failure is environmental,
+			// not a poisoned conversation. Out of scope for this
+			// classifier.
+			name:   "401 auth error",
+			errMsg: `API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"invalid api key"}}`,
+			wantOK: false,
+		},
+		{
+			// A tool surfacing a 400 from somewhere unrelated must not
+			// trigger the classifier — only the combination of 400 +
+			// invalid_request_error indicates a corrupted body.
+			name:   "tool 400 without invalid_request_error",
+			errMsg: `agent tool returned status 400: not found`,
+			wantOK: false,
+		},
+		{
+			name:   "empty error message",
+			errMsg: "",
+			wantOK: false,
+		},
+		{
+			name:   "unrelated execution error",
+			errMsg: "claude execution timeout after 10m",
+			wantOK: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reason, ok := classifyPoisonedError(tc.errMsg)
+			if ok != tc.wantOK {
+				t.Fatalf("classifyPoisonedError(%q) ok=%v, want %v", tc.errMsg, ok, tc.wantOK)
+			}
+			if ok && reason != tc.wantReason {
+				t.Fatalf("classifyPoisonedError(%q) reason=%q, want %q", tc.errMsg, reason, tc.wantReason)
+			}
+		})
+	}
+}
+
+func TestClassifyResumeUnsafeTimeout(t *testing.T) {
+	cases := []struct {
+		name       string
+		provider   string
+		errMsg     string
+		wantOK     bool
+		wantReason string
+	}{
+		{
+			name:       "codex semantic inactivity",
+			provider:   "codex",
+			errMsg:     agent.CodexSemanticInactivityMarker + " after 10m0s without agent progress (last activity: tool-result:exec_command)",
+			wantOK:     true,
+			wantReason: FailureReasonCodexSemanticInactivity,
+		},
+		{
+			name:     "codex ordinary timeout remains resumable",
+			provider: "codex",
+			errMsg:   "codex timed out after 30m0s",
+			wantOK:   false,
+		},
+		{
+			name:     "other provider same text is not classified",
+			provider: "claude",
+			errMsg:   agent.CodexSemanticInactivityMarker + " after 10m0s without agent progress",
+			wantOK:   false,
+		},
+		{
+			name:     "empty error",
+			provider: "codex",
+			errMsg:   "",
+			wantOK:   false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reason, ok := classifyResumeUnsafeTimeout(tc.provider, tc.errMsg)
+			if ok != tc.wantOK {
+				t.Fatalf("classifyResumeUnsafeTimeout(%q, %q) ok=%v, want %v", tc.provider, tc.errMsg, ok, tc.wantOK)
+			}
+			if ok && reason != tc.wantReason {
+				t.Fatalf("classifyResumeUnsafeTimeout(%q, %q) reason=%q, want %q", tc.provider, tc.errMsg, reason, tc.wantReason)
 			}
 		})
 	}

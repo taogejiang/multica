@@ -1,6 +1,6 @@
 ---
 title: Autopilots
-description: 让智能体按 cron 定时自己开工——或通过 UI / CLI 手动触发一次。
+description: 让智能体按 cron 定时自己开工，或在 webhook 到来时被触发——也可以通过 UI / CLI 手动触发一次。
 ---
 
 import { Callout } from "fumadocs-ui/components/callout";
@@ -16,18 +16,14 @@ Autopilots 让 [智能体](/agents) **按调度自动开工**——配好 cron �
 - **优先级** — 继承给它产生的 `task`（语义同 issue 优先级）
 - **描述 / Prompt** — 智能体每次执行拿到的工作说明
 - **执行模式** — 见下节
-- **触发器** — 至少加一条 `schedule`（cron + 时区）
+- **触发器** — 至少加一条 `schedule`（cron + 时区）或 `webhook`
 
 ## 选择执行模式
 
 Autopilot 有两种执行模式，**建议从"先建 issue 模式"开始**：
 
-- **先建 issue 模式**（`create_issue`）—— 默认，**推荐**。每次触发先在工作区里建一个 issue（标题支持 `{{date}}` 这样的插值），再按分配流程把 issue 派给智能体。所有工作都落在 issue 看板上，历史、评论、状态和手动分配的 issue 完全一致。
+- **先建 issue 模式**（`create_issue`）—— 默认，**推荐**。每次触发先在工作区里建一个 issue（标题目前只支持一个占位符 `{{date}}`，会插值成 UTC 日期 `YYYY-MM-DD`；其他 `{{...}}` 形式的占位符会在创建时被拒绝，避免拼错以后悄无声息地把原文当成 issue 标题），再按分配流程把 issue 派给智能体。所有工作都落在 issue 看板上，历史、评论、状态和手动分配的 issue 完全一致。
 - **直跑模式**（`run_only`）—— 不建 issue，直接入队一个 `task`。看板上看不到这一次运行——只能在 Autopilot 的运行历史里看到。
-
-<Callout type="warning">
-**直跑模式当前不稳定**——目前在 CLI 里被标注为"not yet supported end-to-end"，派发路径有已知问题。新用户只使用先建 issue 模式，等直跑模式 ship 稳定版再切。
-</Callout>
 
 ## 让它按时间跑
 
@@ -54,15 +50,105 @@ multica autopilot trigger <autopilot-id>
 
 手动触发走和 `schedule` 触发完全相同的执行流程，只是运行记录里 `source` 字段标为 `manual`。
 
+## 通过 Webhook 触发
+
+Autopilot 也可以由入站 HTTP webhook 触发。在详情页添加一个 **Webhook**
+触发器，Multica 会生成一个唯一的 URL：
+
+```
+https://<你的 Multica host>/api/webhooks/autopilots/awt_…
+```
+
+向这个 URL POST 任意 JSON——Multica 会记录一条 `source = webhook` 的
+run，把请求体保存为 run 的 `trigger_payload`，然后按和 schedule 触发器
+完全一致的方式派发给智能体。
+
+```bash
+curl -X POST "$MULTICA_WEBHOOK_URL" \
+  -H "Content-Type: application/json" \
+  -d '{"event":"demo.received","eventPayload":{"message":"hello"}}'
+```
+
+在**先建 issue 模式**下，入站 payload 会附加在新 issue 的描述里供智能体
+直接读到；**直跑模式**下，payload 也会随 run 一并交给 daemon。
+
+### Payload 形态
+
+可以发自己的封装：
+
+```json
+{ "event": "github.pull_request.opened", "eventPayload": { } }
+```
+
+也可以直接发任意 JSON 对象 / 数组。Multica 会规范化为内部封装：
+
+```json
+{
+  "event": "<推断>",
+  "eventPayload": <你的 body>,
+  "request": { "receivedAt": "<rfc3339>", "contentType": "application/json" }
+}
+```
+
+不带 `event` 字段时，Multica 会按以下顺序从常见 header 和 body 字段
+推断：`X-GitHub-Event` + body `action`，`X-Gitlab-Event`、
+`X-Event-Type`、body 里的 `event` / `type` / `action`。都不命中时事件
+名退化为 `webhook.received`。
+
+配置 GitHub 之类的来源时，请把 content type 设为 `application/json`——
+表单编码的 webhook payload 在 v1 里不接受。
+
+### URL 即 bearer secret
+
+生成的 URL **就是凭证**，谁拿到都能触发这个 Autopilot。请按 token 对待：
+
+- **不要贴到公开 issue 评论、截图、聊天记录里。**
+- **泄漏后立即重新生成**——在触发器上点"重新生成 URL"，或运行
+  `multica autopilot trigger-rotate-url <autopilot-id> <trigger-id>`。
+  旧 URL 立即失效。
+- 对需要强来源认证的源，等 per-trigger HMAC 签名校验上线；v1 URL 仅
+  bearer。
+- 当前能查看 Autopilot 的工作区成员都能看到它的 webhook URL——更细的
+  权限可见性是后续工作。
+
+### 状态码语义
+
+正常的 no-op 路径都返回 `200 OK` 加 `status` 字段，避免外部 webhook 重试
+机制反复打：
+
+- `{"status":"accepted","run_id":"…","autopilot_id":"…","trigger_id":"…"}`
+  —— 已派发一次 run。
+- `{"status":"skipped","run_id":"…","reason":"agent runtime is offline at dispatch time"}`
+  —— 受派智能体的 runtime 离线，记为 `skipped` run。
+- `{"status":"ignored","reason":"trigger_disabled"}` —— 触发器已禁用。
+- `{"status":"ignored","reason":"autopilot_paused"}` —— Autopilot 已暂停。
+- `{"status":"ignored","reason":"autopilot_archived"}` —— Autopilot 已归档。
+
+非 2xx 是真正的失败：
+
+- `400` —— 无效 JSON、scalar body、空 body。
+- `404` —— 未知 token（`{"error":"webhook not found"}`）。
+- `413` —— 请求体超过 256 KiB。
+- `429` —— 单 token 速率限制（默认 60 次 / 分钟）。
+
+### 自托管：配置公开 URL
+
+服务端设置 `MULTICA_PUBLIC_URL`（例如 `https://multica.example.com`）后，
+触发器响应里会带绝对的 `webhook_url`，UI 直接显示可复制的 URL。没设
+时 UI 会用客户端的 API origin 拼出 URL——desktop 和同源 web 没问题，
+但自定义反向代理就不行了。Multica **故意不**从 `Host` /
+`X-Forwarded-Host` header 推断公开主机，避免反代配置失误时被诱导生成
+指向攻击者域名的 webhook URL。
+
 ## 看运行历史
 
 每次触发都会产生一条**运行记录**（run），可以在 Autopilot 详情页的"历史"tab 看到：
 
-- 触发源（`schedule` / `manual`）
+- 触发源（`schedule` / `manual` / `webhook`）
 - 开始时间、完成时间
-- 状态（`issue_created` / `running` / `completed` / `failed`）
+- 状态（`issue_created` / `running` / `completed` / `failed` / `skipped`）
 - 关联的 issue（先建 issue 模式）或 `task`（直跑模式）
-- 失败原因（如果失败）
+- 失败原因（失败或跳过时）
 
 ## Autopilot 失败会怎样
 
@@ -76,7 +162,10 @@ multica autopilot trigger <autopilot-id>
 
 ## 暂不可用的能力
 
-**Webhook 和 API 触发暂不可用**。Autopilot 的触发器类型在 schema 里预留了 `webhook` 和 `api` 两种，但**还没接入站路由**——UI 可以创建这两类触发器，不会真的触发。目前**只有 `schedule` 和手动触发是端到端可用的**。
+**API 类型触发器尚未接入。** 触发器 schema 里保留了 `api` 类型但没有
+入站路由会触发它；UI 会给已有的此类记录打 Deprecated 标签，也不显示
+copy / rotate 操作。Per-trigger HMAC 签名校验、IP allowlist、按提供方
+的事件预设是后续工作；v1 URL 仅 bearer。
 
 ## 下一步
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -228,86 +229,163 @@ func TestHub_MultipleBroadcasts(t *testing.T) {
 // headers on WS upgrades, so this query-param channel is the only way to
 // preserve the same observability dimensions HTTP clients get via X-Client-*.
 func TestHandleWebSocket_ClientIdentityFromQuery(t *testing.T) {
-var buf bytes.Buffer
-var mu sync.Mutex
-handler := slog.NewJSONHandler(&lockedWriter{w: &buf, mu: &mu}, &slog.HandlerOptions{Level: slog.LevelDebug})
-prevDefault := slog.Default()
-slog.SetDefault(slog.New(handler))
-t.Cleanup(func() { slog.SetDefault(prevDefault) })
+	var buf bytes.Buffer
+	var mu sync.Mutex
+	handler := slog.NewJSONHandler(&lockedWriter{w: &buf, mu: &mu}, &slog.HandlerOptions{Level: slog.LevelDebug})
+	prevDefault := slog.Default()
+	slog.SetDefault(slog.New(handler))
+	t.Cleanup(func() { slog.SetDefault(prevDefault) })
 
-_, server := newTestHub(t)
-defer server.Close()
+	_, server := newTestHub(t)
+	defer server.Close()
 
-token := makeTestToken(t)
-wsURL := "ws" + strings.TrimPrefix(server.URL, "http") +
-"/ws?workspace_id=" + testWorkspaceID +
-"&client_platform=desktop&client_version=1.2.3&client_os=macos"
-conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-if err != nil {
-t.Fatalf("dial: %v", err)
-}
-defer conn.Close()
+	token := makeTestToken(t)
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") +
+		"/ws?workspace_id=" + testWorkspaceID +
+		"&client_platform=desktop&client_version=1.2.3&client_os=macos"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
 
-authMsg, _ := json.Marshal(map[string]any{
-"type":    "auth",
-"payload": map[string]string{"token": token},
-})
-if err := conn.WriteMessage(websocket.TextMessage, authMsg); err != nil {
-t.Fatalf("write auth: %v", err)
-}
-conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-if _, _, err := conn.ReadMessage(); err != nil {
-t.Fatalf("read auth_ack: %v", err)
-}
+	authMsg, _ := json.Marshal(map[string]any{
+		"type":    "auth",
+		"payload": map[string]string{"token": token},
+	})
+	if err := conn.WriteMessage(websocket.TextMessage, authMsg); err != nil {
+		t.Fatalf("write auth: %v", err)
+	}
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, _, err := conn.ReadMessage(); err != nil {
+		t.Fatalf("read auth_ack: %v", err)
+	}
 
-// Wait briefly for the "websocket connected" log line to be flushed.
-deadline := time.Now().Add(2 * time.Second)
-var found map[string]any
-for time.Now().Before(deadline) {
-mu.Lock()
-raw := buf.String()
-mu.Unlock()
-for _, line := range strings.Split(raw, "\n") {
-if line == "" {
-continue
-}
-var entry map[string]any
-if err := json.Unmarshal([]byte(line), &entry); err != nil {
-continue
-}
-if msg, _ := entry["msg"].(string); msg == "websocket connected" {
-found = entry
-break
-}
-}
-if found != nil {
-break
-}
-time.Sleep(20 * time.Millisecond)
-}
+	// Wait briefly for the "websocket connected" log line to be flushed.
+	deadline := time.Now().Add(2 * time.Second)
+	var found map[string]any
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		raw := buf.String()
+		mu.Unlock()
+		for _, line := range strings.Split(raw, "\n") {
+			if line == "" {
+				continue
+			}
+			var entry map[string]any
+			if err := json.Unmarshal([]byte(line), &entry); err != nil {
+				continue
+			}
+			if msg, _ := entry["msg"].(string); msg == "websocket connected" {
+				found = entry
+				break
+			}
+		}
+		if found != nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
-if found == nil {
-t.Fatalf("did not observe \"websocket connected\" log entry; buffered logs:\n%s", buf.String())
-}
-if got, _ := found["client_platform"].(string); got != "desktop" {
-t.Errorf("client_platform = %q, want %q", got, "desktop")
-}
-if got, _ := found["client_version"].(string); got != "1.2.3" {
-t.Errorf("client_version = %q, want %q", got, "1.2.3")
-}
-if got, _ := found["client_os"].(string); got != "macos" {
-t.Errorf("client_os = %q, want %q", got, "macos")
-}
+	if found == nil {
+		t.Fatalf("did not observe \"websocket connected\" log entry; buffered logs:\n%s", buf.String())
+	}
+	if got, _ := found["client_platform"].(string); got != "desktop" {
+		t.Errorf("client_platform = %q, want %q", got, "desktop")
+	}
+	if got, _ := found["client_version"].(string); got != "1.2.3" {
+		t.Errorf("client_version = %q, want %q", got, "1.2.3")
+	}
+	if got, _ := found["client_os"].(string); got != "macos" {
+		t.Errorf("client_os = %q, want %q", got, "macos")
+	}
 }
 
 // lockedWriter is a thread-safe writer used to capture concurrent slog output.
 type lockedWriter struct {
-w  *bytes.Buffer
-mu *sync.Mutex
+	w  *bytes.Buffer
+	mu *sync.Mutex
 }
 
 func (l *lockedWriter) Write(p []byte) (int, error) {
-l.mu.Lock()
-defer l.mu.Unlock()
-return l.w.Write(p)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
+}
+
+type failingWSWriter struct {
+	err error
+}
+
+func (f failingWSWriter) WriteMessage(int, []byte) error {
+	return f.err
+}
+
+func TestWriteWSAuthFrameLogsWriteErrors(t *testing.T) {
+	var buf bytes.Buffer
+	prevDefault := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prevDefault) })
+
+	ok := writeWSAuthFrame(
+		failingWSWriter{err: errors.New("write blocked")},
+		[]byte(`{"error":"invalid token"}`),
+		"auth_error",
+		"workspace_id", testWorkspaceID,
+	)
+
+	if ok {
+		t.Fatal("expected writeWSAuthFrame to report failed write")
+	}
+	logs := buf.String()
+	if !strings.Contains(logs, "ws: failed to send auth frame") {
+		t.Fatalf("expected auth frame write failure log, got:\n%s", logs)
+	}
+	if !strings.Contains(logs, "write blocked") {
+		t.Fatalf("expected write error in log, got:\n%s", logs)
+	}
+	if !strings.Contains(logs, "auth_error") {
+		t.Fatalf("expected frame kind in log, got:\n%s", logs)
+	}
+	if !strings.Contains(logs, testWorkspaceID) {
+		t.Fatalf("expected workspace id in log, got:\n%s", logs)
+	}
+}
+
+func TestCheckOrigin(t *testing.T) {
+	prev := allowedWSOrigins.Load().([]string)
+	SetAllowedOrigins([]string{
+		"http://localhost:3000",
+		"https://multica.ai",
+	})
+	t.Cleanup(func() { SetAllowedOrigins(prev) })
+
+	cases := []struct {
+		name   string
+		host   string
+		origin string
+		want   bool
+	}{
+		{"empty origin allowed", "api.multica.ai", "", true},
+		{"same-origin allowed (native client default)", "localhost:8080", "http://localhost:8080", true},
+		{"same-origin allowed (https)", "api.multica.ai", "https://api.multica.ai", true},
+		{"same-origin allowed (case-insensitive host, RFC 7230)", "API.Multica.AI", "https://api.multica.ai", true},
+		{"whitelisted origin allowed (web cross-origin)", "localhost:8080", "http://localhost:3000", true},
+		{"whitelisted origin allowed (prod web)", "api.multica.ai", "https://multica.ai", true},
+		{"unknown origin rejected (CSWSH defense)", "api.multica.ai", "https://evil.com", false},
+		{"different port rejected", "localhost:8080", "http://localhost:9999", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/ws", nil)
+			r.Host = tc.host
+			if tc.origin != "" {
+				r.Header.Set("Origin", tc.origin)
+			}
+			if got := checkOrigin(r); got != tc.want {
+				t.Fatalf("checkOrigin(host=%q, origin=%q) = %v, want %v", tc.host, tc.origin, got, tc.want)
+			}
+		})
+	}
 }

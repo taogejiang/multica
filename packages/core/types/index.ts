@@ -1,4 +1,4 @@
-export type { Issue, IssueStatus, IssuePriority, IssueAssigneeType, IssueReaction } from "./issue";
+export type { Issue, IssueStatus, IssuePriority, IssueAssigneeType, IssueMetadata, IssueMetadataValue, IssueReaction } from "./issue";
 export type {
   Agent,
   AgentStatus,
@@ -11,6 +11,12 @@ export type {
   AgentRuntime,
   RuntimeDevice,
   CreateAgentRequest,
+  AgentTemplate,
+  AgentTemplateSummary,
+  AgentTemplateSkillRef,
+  CreateAgentFromTemplateRequest,
+  CreateAgentFromTemplateResponse,
+  CreateAgentFromTemplateFailure,
   UpdateAgentRequest,
   Skill,
   SkillSummary,
@@ -23,9 +29,15 @@ export type {
   RuntimeHourlyActivity,
   RuntimeUsageByAgent,
   RuntimeUsageByHour,
+  DashboardUsageDaily,
+  DashboardUsageByAgent,
+  DashboardAgentRunTime,
+  DashboardRunTimeDaily,
   RuntimeUpdate,
   RuntimeUpdateStatus,
   RuntimeModel,
+  RuntimeModelThinking,
+  RuntimeModelThinkingLevel,
   RuntimeModelListRequest,
   RuntimeModelListStatus,
   RuntimeModelsResult,
@@ -45,8 +57,6 @@ export type { Comment, CommentType, CommentAuthorType, Reaction } from "./commen
 export type { Label, CreateLabelRequest, UpdateLabelRequest, ListLabelsResponse, IssueLabelsResponse } from "./label";
 export type {
   TimelineEntry,
-  TimelinePage,
-  TimelinePageParam,
   AssigneeFrequencyEntry,
 } from "./activity";
 export type { IssueSubscriber } from "./subscriber";
@@ -70,9 +80,19 @@ export type {
 } from "./project";
 export type { PinnedItem, PinnedItemType, CreatePinRequest, ReorderPinsRequest } from "./pin";
 export type {
+  GitHubInstallation,
+  GitHubMergeableState,
+  GitHubPullRequest,
+  GitHubPullRequestChecksConclusion,
+  GitHubPullRequestState,
+  ListGitHubInstallationsResponse,
+  GitHubConnectResponse,
+} from "./github";
+export type {
   Autopilot,
   AutopilotStatus,
   AutopilotExecutionMode,
+  AutopilotAssigneeType,
   AutopilotTrigger,
   AutopilotTriggerKind,
   AutopilotRun,
@@ -85,4 +105,25 @@ export type {
   ListAutopilotsResponse,
   GetAutopilotResponse,
   ListAutopilotRunsResponse,
+  WebhookDelivery,
+  WebhookDeliveryStatus,
+  WebhookSignatureStatus,
+  ListWebhookDeliveriesResponse,
 } from "./autopilot";
+export type {
+  Squad,
+  SquadMember,
+  SquadMemberType,
+  SquadActivityLog,
+  SquadActivityOutcome,
+  CreateSquadRequest,
+  UpdateSquadRequest,
+  AddSquadMemberRequest,
+  RemoveSquadMemberRequest,
+  UpdateSquadMemberRoleRequest,
+  CreateSquadActivityLogRequest,
+  SquadMemberStatusValue,
+  SquadActiveIssueBrief,
+  SquadMemberStatus,
+  SquadMemberStatusListResponse,
+} from "./squad";

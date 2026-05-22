@@ -15,6 +15,7 @@ import {
   nameToWorkspaceSlug,
 } from "./slug";
 import { useT } from "../i18n";
+import { isReservedSlug } from "@multica/core/paths";
 
 export interface CreateWorkspaceFormProps {
   onSuccess: (workspace: Workspace) => void | Promise<void>;
@@ -32,7 +33,11 @@ export function CreateWorkspaceForm({ onSuccess }: CreateWorkspaceFormProps) {
     slug.length > 0 && !WORKSPACE_SLUG_REGEX.test(slug)
       ? t(($) => $.create_form.errors.slug_format)
       : null;
-  const slugError = slugValidationError ?? slugServerError;
+  const slugReservedError =
+    slug.length > 0 && isReservedSlug(slug)
+      ? t(($) => $.create_form.errors.slug_reserved)
+      : null;
+  const slugError = slugValidationError ?? slugReservedError ?? slugServerError;
   const canSubmit =
     name.trim().length > 0 && slug.trim().length > 0 && !slugError;
 
@@ -62,7 +67,11 @@ export function CreateWorkspaceForm({ onSuccess }: CreateWorkspaceFormProps) {
             toast.error(t(($) => $.create_form.errors.slug_conflict_toast));
             return;
           }
-          toast.error(t(($) => $.create_form.errors.create_failed));
+          toast.error(
+            error instanceof Error && error.message
+              ? error.message
+              : t(($) => $.create_form.errors.create_failed),
+          );
         },
       },
     );

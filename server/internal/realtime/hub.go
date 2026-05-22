@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -79,6 +80,16 @@ func SetAllowedOrigins(origins []string) {
 func checkOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
+		return true
+	}
+	// Same-origin: native clients (mobile, CLI) have no real page host, so
+	// their WebSocket library fills Origin with the connection target —
+	// which equals the server's own Host. They authenticate via bearer
+	// token, not auto-attached cookies, so CSRF (the attack the explicit
+	// allowlist below defends against) does not apply. This matches the
+	// gorilla/websocket default CheckOrigin behavior; the allowlist exists
+	// in addition to support cross-origin browser clients (web/desktop).
+	if u, err := url.Parse(origin); err == nil && strings.EqualFold(u.Host, r.Host) {
 		return true
 	}
 	origins := allowedWSOrigins.Load().([]string)
@@ -624,6 +635,24 @@ func firstMessageAuth(conn *websocket.Conn) (string, string) {
 	return msg.Payload.Token, ""
 }
 
+type wsMessageWriter interface {
+	WriteMessage(messageType int, data []byte) error
+}
+
+func writeWSAuthFrame(conn wsMessageWriter, payload []byte, frame string, attrs ...any) bool {
+	if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+		logAttrs := append([]any{"frame", frame, "error", err}, attrs...)
+		slog.Warn("ws: failed to send auth frame", logAttrs...)
+		return false
+	}
+	return true
+}
+
+func writeWSAuthErrorAndClose(conn *websocket.Conn, payload []byte, attrs ...any) {
+	writeWSAuthFrame(conn, payload, "auth_error", attrs...)
+	conn.Close()
+}
+
 // HandleWebSocket upgrades an HTTP connection to WebSocket with cookie or
 // first-message auth.
 func HandleWebSocket(hub *Hub, mc MembershipChecker, pr PATResolver, resolveSlug SlugResolver, w http.ResponseWriter, r *http.Request) {
@@ -666,24 +695,35 @@ func HandleWebSocket(hub *Hub, mc MembershipChecker, pr PATResolver, resolveSlug
 	if userID == "" {
 		tokenStr, errMsg := firstMessageAuth(conn)
 		if errMsg != "" {
-			conn.WriteMessage(websocket.TextMessage, []byte(errMsg))
-			conn.Close()
+			writeWSAuthErrorAndClose(conn, []byte(errMsg), "workspace_id", workspaceID)
 			return
 		}
 		uid, errMsg := authenticateToken(tokenStr, pr, r.Context())
 		if errMsg != "" {
-			conn.WriteMessage(websocket.TextMessage, []byte(errMsg))
-			conn.Close()
+			writeWSAuthErrorAndClose(conn, []byte(errMsg), "workspace_id", workspaceID)
 			return
 		}
 		if !mc.IsMember(r.Context(), uid, workspaceID) {
-			conn.WriteMessage(websocket.TextMessage, []byte(`{"error":"not a member of this workspace"}`))
-			conn.Close()
+			writeWSAuthErrorAndClose(
+				conn,
+				[]byte(`{"error":"not a member of this workspace"}`),
+				"workspace_id", workspaceID,
+				"user_id", uid,
+			)
 			return
 		}
 		userID = uid
 
-		conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"auth_ack"}`))
+		if !writeWSAuthFrame(
+			conn,
+			[]byte(`{"type":"auth_ack"}`),
+			"auth_ack",
+			"workspace_id", workspaceID,
+			"user_id", userID,
+		) {
+			conn.Close()
+			return
+		}
 	}
 
 	// Capture client metadata from query params (browsers cannot set custom

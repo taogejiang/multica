@@ -1,28 +1,12 @@
--- name: ListActivitiesLatest :many
--- Top N activities for an issue, newest first. Used by the cursor-paginated
--- timeline endpoint to assemble the latest page.
+-- name: ListActivitiesForIssue :many
+-- All activities for an issue in chronological order, capped at $2 (DB safety
+-- net to bound the response).
 SELECT * FROM activity_log
 WHERE issue_id = $1
-ORDER BY created_at DESC, id DESC
+ORDER BY created_at ASC, id ASC
 LIMIT $2;
 
--- name: ListActivitiesBefore :many
-SELECT * FROM activity_log
-WHERE issue_id = $1
-  AND (created_at, id) < ($2::timestamptz, $3::uuid)
-ORDER BY created_at DESC, id DESC
-LIMIT $4;
-
--- name: ListActivitiesAfter :many
-SELECT * FROM activity_log
-WHERE issue_id = $1
-  AND (created_at, id) > ($2::timestamptz, $3::uuid)
-ORDER BY created_at ASC, id ASC
-LIMIT $4;
-
 -- name: GetActivity :one
--- Used by the around-id mode of ListTimeline to resolve an entry to its
--- (created_at, id) cursor when the entry is an activity.
 SELECT * FROM activity_log
 WHERE id = $1;
 
@@ -31,6 +15,18 @@ INSERT INTO activity_log (
     workspace_id, issue_id, actor_type, actor_id, action, details
 ) VALUES ($1, $2, $3, $4, $5, $6)
 RETURNING *;
+
+-- name: HasSquadLeaderNoActionEvaluationForTask :one
+SELECT EXISTS (
+  SELECT 1
+  FROM activity_log
+  WHERE issue_id = @issue_id
+    AND actor_type = 'agent'
+    AND actor_id = @agent_id
+    AND action = 'squad_leader_evaluated'
+    AND details->>'outcome' = 'no_action'
+    AND details->>'task_id' = @task_id::text
+) AS exists;
 
 -- name: CountAssigneeChangesByActor :many
 -- Count how many times a user assigned each target via assignee_changed activities.

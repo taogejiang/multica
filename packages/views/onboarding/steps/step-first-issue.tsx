@@ -13,10 +13,10 @@ import { useT } from "../../i18n";
 /**
  * Step 5 — the final onboarding beat.
  *
- * All this step does now is flip `onboarded_at` on the server. The former
- * in-flight bootstrap (welcome issue + Getting Started project + sub-issues)
- * moved out of onboarding entirely: it's a post-landing opt-in dialog
- * (`StarterContentPrompt`) that runs inside the workspace after navigation.
+ * Runtime-skipped finalizer. The runtime-connected path now bootstraps one
+ * default assistant plus one onboarding issue server-side and routes there
+ * directly. This step remains for users who skip runtime connection: it only
+ * flips `onboarded_at` and lands them in the workspace.
  * Two consequences of that move:
  *
  *   1. This step can't fail in user-visible ways any more. `completeOnboarding`
@@ -30,6 +30,7 @@ import { useT } from "../../i18n";
 export function StepFirstIssue({
   onFinished,
   completionPath,
+  workspaceId,
 }: {
   /** Called after `onboarded_at` is set server-side. Parent handles
    *  navigation to the workspace landing page. */
@@ -38,6 +39,7 @@ export function StepFirstIssue({
    *  Computed in the parent shell where runtime + waitlist state are
    *  both in scope. */
   completionPath: OnboardingCompletionPath;
+  workspaceId?: string;
 }) {
   const { t } = useT("onboarding");
   const [error, setError] = useState<string | null>(null);
@@ -47,13 +49,18 @@ export function StepFirstIssue({
   onFinishedRef.current = onFinished;
   const completionPathRef = useRef(completionPath);
   completionPathRef.current = completionPath;
+  const workspaceIdRef = useRef(workspaceId);
+  workspaceIdRef.current = workspaceId;
 
   useEffect(() => {
     if (started.current) return;
     started.current = true;
     (async () => {
       try {
-        await completeOnboarding(completionPathRef.current);
+        await completeOnboarding(
+          completionPathRef.current,
+          workspaceIdRef.current,
+        );
         onFinishedRef.current();
       } catch (err) {
         setError(
@@ -68,10 +75,14 @@ export function StepFirstIssue({
     setRetrying(true);
     setError(null);
     try {
-      await completeOnboarding(completionPathRef.current);
+      await completeOnboarding(
+        completionPathRef.current,
+        workspaceIdRef.current,
+      );
       onFinishedRef.current();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : t(($) => $.first_issue.retry_failed);
+      const msg =
+        err instanceof Error ? err.message : t(($) => $.first_issue.retry_failed);
       setError(msg);
       toast.error(msg);
     } finally {

@@ -177,6 +177,108 @@ func TestNewTaskSlotSemaphoreReturnsStableSlotIndexes(t *testing.T) {
 	}
 }
 
+func TestProviderNeedsInlineSystemPrompt(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		provider string
+		want     bool
+	}{
+		{provider: "openclaw", want: true},
+		// Hermes ACP starts in the task cwd and loads AGENTS.md / .agent_context
+		// directly. Inlining the full runtime brief duplicates that context and
+		// can trip upstream provider safety filters on otherwise harmless tasks.
+		{provider: "hermes", want: false},
+		{provider: "kiro", want: true},
+		{provider: "kimi", want: true},
+		{provider: "codex", want: false},
+		{provider: "claude", want: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.provider, func(t *testing.T) {
+			t.Parallel()
+			if got := providerNeedsInlineSystemPrompt(tc.provider); got != tc.want {
+				t.Fatalf("providerNeedsInlineSystemPrompt(%q) = %v, want %v", tc.provider, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestComposeOpenclawIncludeRoots — the Elon must-fix regression: the
+// daemon must grant OpenClaw permission to follow the wrapper's $include
+// link from envRoot into the user's active config dir, while preserving
+// any roots the user already configured in their shell env so their own
+// cross-directory layouts keep working.
+func TestComposeOpenclawIncludeRoots(t *testing.T) {
+	t.Parallel()
+
+	sep := string(os.PathListSeparator)
+	cases := []struct {
+		name    string
+		add     string
+		user    string
+		want    string
+		wantSet bool
+	}{
+		{
+			// Fresh install — preparer emits no $include, so daemon
+			// shouldn't touch OPENCLAW_INCLUDE_ROOTS at all.
+			name:    "fresh_install_no_root_to_grant",
+			add:     "",
+			user:    "/some/user/dir",
+			wantSet: false,
+		},
+		{
+			// User has no existing value — output is just the granted dir.
+			name:    "no_user_value",
+			add:     "/home/alice/.openclaw",
+			user:    "",
+			want:    "/home/alice/.openclaw",
+			wantSet: true,
+		},
+		{
+			// User has their own include roots — daemon must prepend
+			// granted dir AND preserve user's entries verbatim.
+			name:    "preserves_user_value",
+			add:     "/home/alice/.openclaw",
+			user:    "/etc/openclaw" + sep + "/opt/openclaw/shared",
+			want:    "/home/alice/.openclaw" + sep + "/etc/openclaw" + sep + "/opt/openclaw/shared",
+			wantSet: true,
+		},
+		{
+			// User's value already contains the granted dir — daemon
+			// must dedupe rather than emit a redundant entry that would
+			// trip OpenClaw confused-deputy heuristics.
+			name:    "dedupes_when_user_already_grants_same_dir",
+			add:     "/home/alice/.openclaw",
+			user:    "/home/alice/.openclaw" + sep + "/etc/openclaw",
+			want:    "/home/alice/.openclaw" + sep + "/etc/openclaw",
+			wantSet: true,
+		},
+		{
+			// Stray empty segments from a malformed user env are skipped.
+			name:    "skips_empty_segments_in_user_value",
+			add:     "/home/alice/.openclaw",
+			user:    "" + sep + "/etc/openclaw" + sep + "",
+			want:    "/home/alice/.openclaw" + sep + "/etc/openclaw",
+			wantSet: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, ok := composeOpenclawIncludeRoots(tc.add, tc.user)
+			if ok != tc.wantSet {
+				t.Fatalf("ok = %v, want %v (got = %q)", ok, tc.wantSet, got)
+			}
+			if got != tc.want {
+				t.Errorf("got = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestBuildPromptContainsIssueID(t *testing.T) {
 	t.Parallel()
 
@@ -189,7 +291,7 @@ func TestBuildPromptContainsIssueID(t *testing.T) {
 				{Name: "Concise", Content: "Be concise."},
 			},
 		},
-	})
+	}, "claude")
 
 	// Prompt should contain the issue ID and CLI hint.
 	for _, want := range []string{
@@ -215,7 +317,7 @@ func TestBuildPromptNoIssueDetails(t *testing.T) {
 	prompt := BuildPrompt(Task{
 		IssueID: "test-id",
 		Agent:   &AgentData{Name: "Test"},
-	})
+	}, "claude")
 
 	// Prompt should not contain issue title/description (agent fetches via CLI).
 	for _, absent := range []string{"**Issue:**", "**Summary:**"} {
@@ -234,7 +336,7 @@ func TestBuildPromptAutopilotRunOnly(t *testing.T) {
 		AutopilotTitle:       "Daily dependency check",
 		AutopilotDescription: "Check dependencies and report outdated packages.",
 		AutopilotSource:      "manual",
-	})
+	}, "claude")
 
 	for _, want := range []string{
 		"run-only mode",
@@ -266,7 +368,7 @@ func TestBuildPromptCommentTriggered(t *testing.T) {
 		TriggerCommentID:      commentID,
 		TriggerCommentContent: commentContent,
 		Agent:                 &AgentData{Name: "Test"},
-	})
+	}, "claude")
 
 	// Prompt should contain the comment content, the trigger comment id, and
 	// the full reply command with --parent. Re-emitting --parent on every turn
@@ -311,7 +413,7 @@ func TestBuildPromptCommentTriggeredByAgent(t *testing.T) {
 		TriggerAuthorType:     "agent",
 		TriggerAuthorName:     "Atlas",
 		Agent:                 &AgentData{Name: "Test"},
-	})
+	}, "claude")
 
 	for _, want := range []string{
 		"Another agent (Atlas)",
@@ -337,7 +439,7 @@ func TestBuildPromptCommentTriggeredByMember(t *testing.T) {
 		TriggerAuthorType:     "member",
 		TriggerAuthorName:     "Alice",
 		Agent:                 &AgentData{Name: "Test"},
-	})
+	}, "claude")
 
 	if !strings.Contains(prompt, "A user just left a new comment") {
 		t.Fatalf("member-triggered prompt should label the author as a user\n---\n%s", prompt)
@@ -366,10 +468,57 @@ func TestBuildPromptCommentTriggeredNoContent(t *testing.T) {
 		IssueID:          "test-id",
 		TriggerCommentID: "comment-id",
 		Agent:            &AgentData{Name: "Test"},
-	})
+	}, "claude")
 
 	if !strings.Contains(prompt, "multica issue get") {
 		t.Fatal("prompt missing CLI hint")
+	}
+}
+
+// TestBuildPromptSquadLeaderNoActionProhibition verifies that when a squad
+// leader is triggered by another agent's comment, the per-turn prompt
+// explicitly forbids posting a comment whose only purpose is to announce
+// no_action or "exiting silently". This is the fix for MUL-2168.
+func TestBuildPromptSquadLeaderNoActionProhibition(t *testing.T) {
+	t.Parallel()
+
+	prompt := BuildPrompt(Task{
+		IssueID:               "issue-1",
+		TriggerCommentID:      "comment-1",
+		TriggerCommentContent: "Progress update: tests passing.",
+		TriggerAuthorType:     "agent",
+		TriggerAuthorName:     "Worker",
+		Agent: &AgentData{
+			Name:         "Leader",
+			Instructions: "You lead the team.\n\n## Squad Operating Protocol\n\nYou are the LEADER.",
+		},
+	}, "claude")
+
+	for _, want := range []string{
+		"Squad leader no_action rule",
+		"DO NOT post any comment",
+		"multica squad activity",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("squad leader prompt missing %q\n---\n%s", want, prompt)
+		}
+	}
+
+	// Non-squad-leader agent should NOT get the squad leader rule.
+	nonLeaderPrompt := BuildPrompt(Task{
+		IssueID:               "issue-1",
+		TriggerCommentID:      "comment-1",
+		TriggerCommentContent: "Progress update: tests passing.",
+		TriggerAuthorType:     "agent",
+		TriggerAuthorName:     "Worker",
+		Agent: &AgentData{
+			Name:         "Regular",
+			Instructions: "You are a regular agent.",
+		},
+	}, "claude")
+
+	if strings.Contains(nonLeaderPrompt, "Squad leader no_action rule") {
+		t.Fatalf("non-squad-leader prompt should NOT contain squad leader rule\n---\n%s", nonLeaderPrompt)
 	}
 }
 
@@ -449,6 +598,87 @@ func TestIsTaskNotFoundError(t *testing.T) {
 			t.Parallel()
 			if got := isTaskNotFoundError(tc.err); got != tc.want {
 				t.Fatalf("isTaskNotFoundError(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsRuntimeNotFoundError(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "404 with runtime not found body from heartbeat",
+			err: &requestError{
+				Method:     http.MethodPost,
+				Path:       "/api/daemon/heartbeat",
+				StatusCode: http.StatusNotFound,
+				Body:       `{"error":"runtime not found"}`,
+			},
+			want: true,
+		},
+		{
+			name: "404 with runtime not found body from claim",
+			err: &requestError{
+				Method:     http.MethodPost,
+				Path:       "/api/daemon/runtimes/abc/tasks/claim",
+				StatusCode: http.StatusNotFound,
+				Body:       `{"error":"runtime not found"}`,
+			},
+			want: true,
+		},
+		{
+			name: "mixed-case body still matches",
+			err: &requestError{
+				StatusCode: http.StatusNotFound,
+				Body:       `{"error":"Runtime Not Found"}`,
+			},
+			want: true,
+		},
+		{
+			name: "500 with same body must NOT be treated as runtime-not-found",
+			err: &requestError{
+				StatusCode: http.StatusInternalServerError,
+				Body:       `{"error":"runtime not found"}`,
+			},
+			want: false,
+		},
+		{
+			name: "404 with task-not-found body is not runtime-not-found",
+			err: &requestError{
+				StatusCode: http.StatusNotFound,
+				Body:       `{"error":"task not found"}`,
+			},
+			want: false,
+		},
+		{
+			name: "404 with workspace-not-found body is not runtime-not-found",
+			err: &requestError{
+				StatusCode: http.StatusNotFound,
+				Body:       `{"error":"workspace not found"}`,
+			},
+			want: false,
+		},
+		{
+			name: "non-requestError",
+			err:  errors.New("network down"),
+			want: false,
+		},
+		{
+			name: "nil",
+			err:  nil,
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isRuntimeNotFoundError(tc.err); got != tc.want {
+				t.Fatalf("isRuntimeNotFoundError(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
 	}
@@ -864,25 +1094,279 @@ func TestExecuteAndDrain_ContextCancelled_ReportsCancelled(t *testing.T) {
 	}
 }
 
-func TestEnsureRepoReadyFastPathDoesNotRefresh(t *testing.T) {
+// idleWatchdogBackend simulates the MUL-2225 hang: emit one message to mark
+// activity, then go silent forever. With a short AgentIdleWatchdog, the
+// watchdog should fire and short-circuit executeAndDrain instead of waiting
+// for the full drainTimeout (which is ~21 minutes by default).
+type idleWatchdogBackend struct {
+	emitOne bool // when true, emit one message before going silent; when false, never emit anything
+}
+
+func (b idleWatchdogBackend) Execute(_ context.Context, _ string, _ agent.ExecOptions) (*agent.Session, error) {
+	msgCh := make(chan agent.Message, 1)
+	resCh := make(chan agent.Result)
+	if b.emitOne {
+		msgCh <- agent.Message{Type: agent.MessageText, Content: "hello"}
+	}
+	// Deliberately do NOT close msgCh and never write to resCh — this models
+	// a backend whose subprocess is hung and will never naturally complete.
+	return &agent.Session{Messages: msgCh, Result: resCh}, nil
+}
+
+func TestExecuteAndDrain_IdleWatchdog_FiresOnInactivity(t *testing.T) {
+	t.Parallel()
+
+	d := newTestDaemon(t)
+	d.cfg.AgentIdleWatchdog = 50 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	start := time.Now()
+	result, _, err := d.executeAndDrain(ctx, idleWatchdogBackend{emitOne: true}, "p", agent.ExecOptions{}, slog.Default(), "t-idle")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Status != "idle_watchdog" {
+		t.Fatalf("expected status=idle_watchdog, got %q (err=%q)", result.Status, result.Error)
+	}
+	if !strings.Contains(result.Error, "idle watchdog") {
+		t.Fatalf("expected error to mention idle watchdog, got %q", result.Error)
+	}
+	// The watchdog should fire within a few ticks (interval = window/2 with
+	// no floor for sub-minute windows). 5× window is generous and keeps the
+	// test from racing in slow CI.
+	if elapsed := time.Since(start); elapsed > 5*d.cfg.AgentIdleWatchdog {
+		t.Fatalf("watchdog took too long to fire: %s (window=%s)", elapsed, d.cfg.AgentIdleWatchdog)
+	}
+}
+
+func TestExecuteAndDrain_IdleWatchdog_FiresWhenNoMessageEverArrives(t *testing.T) {
+	t.Parallel()
+
+	d := newTestDaemon(t)
+	d.cfg.AgentIdleWatchdog = 50 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	// emitOne=false models a backend that hangs before sending any message.
+	// lastActivityAt is initialised at executeAndDrain entry, so the same
+	// window applies even with zero traffic.
+	result, _, err := d.executeAndDrain(ctx, idleWatchdogBackend{emitOne: false}, "p", agent.ExecOptions{}, slog.Default(), "t-idle-zero")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Status != "idle_watchdog" {
+		t.Fatalf("expected status=idle_watchdog when backend never emits, got %q (err=%q)", result.Status, result.Error)
+	}
+}
+
+func TestExecuteAndDrain_IdleWatchdog_DisabledWhenZero(t *testing.T) {
+	t.Parallel()
+
+	d := newTestDaemon(t)
+	// Default zero value — watchdog disabled. Without a parent cancel the
+	// blockingBackend would otherwise hang the test, so we cancel after a
+	// short delay to confirm the run does NOT terminate as idle_watchdog.
+	d.cfg.AgentIdleWatchdog = 0
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(80*time.Millisecond, cancel)
+
+	result, _, err := d.executeAndDrain(ctx, idleWatchdogBackend{emitOne: true}, "p", agent.ExecOptions{}, slog.Default(), "t-idle-off")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Status == "idle_watchdog" {
+		t.Fatalf("watchdog should not fire when AgentIdleWatchdog=0, got status=%q", result.Status)
+	}
+	if result.Status != "cancelled" {
+		t.Fatalf("expected status=cancelled (parent ctx fired), got %q", result.Status)
+	}
+}
+
+func TestExecuteAndDrain_IdleWatchdog_HappyPathDoesNotFire(t *testing.T) {
+	t.Parallel()
+
+	d := newTestDaemon(t)
+	d.cfg.AgentIdleWatchdog = 200 * time.Millisecond
+
+	// fakeBackend completes immediately with a normal result, well inside the
+	// idle window. The watchdog must not corrupt the disposition.
+	fb := &fakeBackend{
+		results: []agent.Result{
+			{Status: "completed", Output: "done"},
+		},
+	}
+
+	result, _, err := d.executeAndDrain(context.Background(), fb, "p", agent.ExecOptions{}, slog.Default(), "t-idle-happy")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Status != "completed" {
+		t.Fatalf("expected status=completed on happy path, got %q (err=%q)", result.Status, result.Error)
+	}
+	if result.Output != "done" {
+		t.Fatalf("expected output preserved, got %q", result.Output)
+	}
+}
+
+// longToolCallBackend simulates a legitimate long-running tool call (e.g.
+// `npm install`, `docker build`, full test suite). The backend emits a
+// tool_use, stays silent past the idle window while the tool runs, then emits
+// a tool_result and completes. This is the false-positive case the watchdog
+// must NOT misfire on: an in-flight tool call is forward progress, not a hang.
+type longToolCallBackend struct {
+	toolSilence time.Duration // how long to stay silent between tool_use and tool_result
+}
+
+func (b longToolCallBackend) Execute(ctx context.Context, _ string, _ agent.ExecOptions) (*agent.Session, error) {
+	msgCh := make(chan agent.Message, 4)
+	resCh := make(chan agent.Result, 1)
+
+	msgCh <- agent.Message{
+		Type:   agent.MessageToolUse,
+		Tool:   "Bash",
+		CallID: "call-1",
+		Input:  map[string]any{"cmd": "npm install"},
+	}
+
+	go func() {
+		select {
+		case <-time.After(b.toolSilence):
+		case <-ctx.Done():
+			// Watchdog cancelled us — propagate so the caller sees aborted.
+			resCh <- agent.Result{Status: "aborted", Error: ctx.Err().Error()}
+			close(msgCh)
+			close(resCh)
+			return
+		}
+		msgCh <- agent.Message{
+			Type:   agent.MessageToolResult,
+			Tool:   "Bash",
+			CallID: "call-1",
+			Output: "installed 142 packages",
+		}
+		msgCh <- agent.Message{Type: agent.MessageText, Content: "done"}
+		close(msgCh)
+		resCh <- agent.Result{Status: "completed", Output: "done"}
+		close(resCh)
+	}()
+
+	return &agent.Session{Messages: msgCh, Result: resCh}, nil
+}
+
+func TestExecuteAndDrain_IdleWatchdog_DoesNotFireDuringInFlightToolCall(t *testing.T) {
+	t.Parallel()
+
+	d := newTestDaemon(t)
+	// 50 ms window; tool stays silent for ~4× the window. Without the
+	// in-flight-tool gate, the watchdog would fire and the run would come
+	// back as idle_watchdog. With the gate, it must complete normally.
+	d.cfg.AgentIdleWatchdog = 50 * time.Millisecond
+
+	result, _, err := d.executeAndDrain(
+		context.Background(),
+		longToolCallBackend{toolSilence: 200 * time.Millisecond},
+		"p",
+		agent.ExecOptions{},
+		slog.Default(),
+		"t-long-tool",
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Status == "idle_watchdog" {
+		t.Fatalf("watchdog must not fire while a tool_use is in flight, got status=%q (err=%q)", result.Status, result.Error)
+	}
+	if result.Status != "completed" {
+		t.Fatalf("expected status=completed, got %q (err=%q)", result.Status, result.Error)
+	}
+}
+
+// tailIdleAfterToolBackend exercises the boundary case: a tool call completes,
+// and THEN the backend goes silent without ever finishing. After the
+// tool_result lands, in-flight count returns to zero and lastActivityAt is
+// fresh; the watchdog should fire exactly one window later, not earlier.
+type tailIdleAfterToolBackend struct{}
+
+func (tailIdleAfterToolBackend) Execute(_ context.Context, _ string, _ agent.ExecOptions) (*agent.Session, error) {
+	msgCh := make(chan agent.Message, 4)
+	resCh := make(chan agent.Result)
+	msgCh <- agent.Message{Type: agent.MessageToolUse, Tool: "Bash", CallID: "c1"}
+	msgCh <- agent.Message{Type: agent.MessageToolResult, Tool: "Bash", CallID: "c1", Output: "ok"}
+	// Deliberately leave msgCh open and never write to resCh.
+	return &agent.Session{Messages: msgCh, Result: resCh}, nil
+}
+
+func TestExecuteAndDrain_IdleWatchdog_FiresAfterToolResultIfBackendStaysSilent(t *testing.T) {
+	t.Parallel()
+
+	d := newTestDaemon(t)
+	d.cfg.AgentIdleWatchdog = 50 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	result, _, err := d.executeAndDrain(ctx, tailIdleAfterToolBackend{}, "p", agent.ExecOptions{}, slog.Default(), "t-tail-idle")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Status != "idle_watchdog" {
+		t.Fatalf("expected status=idle_watchdog after tool_result with no further activity, got %q (err=%q)", result.Status, result.Error)
+	}
+}
+
+// ensureRepoReady must refresh `workspaceState.settings` on every checkout —
+// even when the repo cache already holds the URL. The /repo/checkout handler
+// reads `workspaceCoAuthoredByEnabled` right after, and the 30s workspace
+// sync tick is too slow to make a freshly-flipped GitHub toggle feel live.
+// PR #2847 review by Emacs caught this fast-path regression; the test
+// asserts the cached-repo path still issues exactly one refresh.
+func TestEnsureRepoReadyCachedRepoStillRefreshesSettings(t *testing.T) {
 	t.Parallel()
 
 	sourceRepo := createDaemonTestRepo(t)
 	var refreshCalls atomic.Int32
 	d := newRepoReadyTestDaemon(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/daemon/workspaces/ws-1/repos" {
+			http.NotFound(w, r)
+			return
+		}
 		refreshCalls.Add(1)
-		http.Error(w, "unexpected refresh", http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(WorkspaceReposResponse{
+			WorkspaceID:  "ws-1",
+			Repos:        []RepoData{{URL: sourceRepo}},
+			ReposVersion: "v2",
+			Settings:     json.RawMessage(`{"github_enabled":false,"co_authored_by_enabled":true}`),
+		})
 	})
 	if err := d.repoCache.Sync("ws-1", []repocache.RepoInfo{{URL: sourceRepo}}); err != nil {
 		t.Fatalf("seed repo cache: %v", err)
 	}
-	d.workspaces["ws-1"] = newWorkspaceState("ws-1", nil, "v1", []RepoData{{URL: sourceRepo}}, nil)
+	// Workspace starts with the master switch ON. The server above will return
+	// the user's just-flipped OFF state — ensureRepoReady must pick that up
+	// before the handler reads workspaceCoAuthoredByEnabled.
+	d.workspaces["ws-1"] = newWorkspaceState(
+		"ws-1",
+		nil,
+		"v1",
+		[]RepoData{{URL: sourceRepo}},
+		json.RawMessage(`{"github_enabled":true,"co_authored_by_enabled":true}`),
+	)
+	if !d.workspaceCoAuthoredByEnabled("ws-1") {
+		t.Fatalf("precondition: expected co-author hook enabled before checkout")
+	}
 
 	if err := d.ensureRepoReady(context.Background(), "ws-1", sourceRepo); err != nil {
 		t.Fatalf("ensureRepoReady: %v", err)
 	}
-	if got := refreshCalls.Load(); got != 0 {
-		t.Fatalf("expected no refresh calls, got %d", got)
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 refresh call on cached repo, got %d", got)
+	}
+	if d.workspaceCoAuthoredByEnabled("ws-1") {
+		t.Fatalf("expected co-author hook disabled after server-side toggle; daemon used stale workspaceState.settings via cache fast path")
 	}
 }
 
@@ -892,20 +1376,29 @@ func TestEnsureRepoReadyTrimsURL(t *testing.T) {
 	sourceRepo := createDaemonTestRepo(t)
 	var refreshCalls atomic.Int32
 	d := newRepoReadyTestDaemon(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/daemon/workspaces/ws-1/repos" {
+			http.NotFound(w, r)
+			return
+		}
 		refreshCalls.Add(1)
-		http.Error(w, "unexpected refresh", http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(WorkspaceReposResponse{
+			WorkspaceID:  "ws-1",
+			Repos:        []RepoData{{URL: sourceRepo}},
+			ReposVersion: "v2",
+		})
 	})
 	if err := d.repoCache.Sync("ws-1", []repocache.RepoInfo{{URL: sourceRepo}}); err != nil {
 		t.Fatalf("seed repo cache: %v", err)
 	}
 	d.workspaces["ws-1"] = newWorkspaceState("ws-1", nil, "v1", []RepoData{{URL: sourceRepo}}, nil)
 
-	// URL with trailing whitespace should still hit the fast path.
+	// URL with trailing whitespace should still resolve to the cached repo.
 	if err := d.ensureRepoReady(context.Background(), "ws-1", "  "+sourceRepo+"  "); err != nil {
 		t.Fatalf("ensureRepoReady with padded URL: %v", err)
 	}
-	if got := refreshCalls.Load(); got != 0 {
-		t.Fatalf("expected no refresh calls for trimmed URL, got %d", got)
+	// Even on cache hit we refresh settings once so toggle flips feel live.
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("expected 1 refresh call for trimmed URL, got %d", got)
 	}
 }
 
@@ -984,8 +1477,12 @@ func TestRegisterTaskReposAllowsProjectOnlyURL(t *testing.T) {
 	if err := d.ensureRepoReady(context.Background(), "ws-1", sourceRepo); err != nil {
 		t.Fatalf("ensureRepoReady: %v", err)
 	}
-	if got := refreshCalls.Load(); got != 0 {
-		t.Fatalf("expected zero workspace-repos refreshes (URL came from project), got %d", got)
+	// ensureRepoReady refreshes settings on every call (RFC MUL-2414 §4.8; PR
+	// #2847 review by Emacs) so a freshly-flipped GitHub toggle takes effect
+	// without waiting for the 30s sync tick. We expect exactly one refresh —
+	// the project-only URL still skips re-cloning because the cache is warm.
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("expected 1 workspace-repos refresh (settings live-refresh on checkout), got %d", got)
 	}
 }
 
@@ -1139,5 +1636,346 @@ func TestDefaultArgsForProvider(t *testing.T) {
 	}
 	if got := defaultArgsForProvider(cfg, "gemini"); got != nil {
 		t.Fatalf("expected nil for unsupported provider, got %#v", got)
+	}
+}
+
+// reportTaskResultRecorder captures which terminal endpoint
+// (.../complete or .../fail) reportTaskResult hits and the body it
+// posts, so the tests can assert the disposition (success vs fail)
+// independently of the rest of handleTask.
+type reportTaskResultRecorder struct {
+	mu      sync.Mutex
+	path    string
+	method  string
+	payload map[string]any
+}
+
+func (r *reportTaskResultRecorder) handler(t *testing.T) http.HandlerFunc {
+	t.Helper()
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		var payload map[string]any
+		if len(body) > 0 {
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Errorf("decode body: %v", err)
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+		r.mu.Lock()
+		r.path = req.URL.Path
+		r.method = req.Method
+		r.payload = payload
+		r.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	})
+}
+
+func TestReportTaskResult_CompletedHitsCompleteEndpoint(t *testing.T) {
+	t.Parallel()
+
+	rec := &reportTaskResultRecorder{}
+	srv := httptest.NewServer(rec.handler(t))
+	t.Cleanup(srv.Close)
+
+	d := &Daemon{client: NewClient(srv.URL), logger: slog.Default()}
+	d.reportTaskResult(context.Background(), "task-1", TaskResult{
+		Status:     "completed",
+		Comment:    "all good",
+		BranchName: "agent/foo",
+		SessionID:  "ses-1",
+		WorkDir:    "/tmp/foo",
+	}, slog.Default())
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if rec.path != "/api/daemon/tasks/task-1/complete" {
+		t.Fatalf("expected /complete endpoint, got %s", rec.path)
+	}
+	if rec.payload["output"] != "all good" {
+		t.Errorf("output: got %v", rec.payload["output"])
+	}
+	if rec.payload["branch_name"] != "agent/foo" {
+		t.Errorf("branch_name: got %v", rec.payload["branch_name"])
+	}
+	if rec.payload["session_id"] != "ses-1" {
+		t.Errorf("session_id: got %v", rec.payload["session_id"])
+	}
+}
+
+// Pins the GitHub multica#1952 fail-closed behaviour: a task whose
+// agent run never produced a real result (blocked, cancelled, or any
+// future status we forget to enumerate) MUST go through FailTask, so
+// the UI never shows a green "Completed" badge for a run that didn't
+// actually do anything (e.g. provider 429 / out-of-credit).
+func TestReportTaskResult_NonCompletedHitsFailEndpoint(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name              string
+		status            string
+		failureReasonIn   string
+		wantFailureReason string
+	}{
+		{
+			name:              "blocked with explicit reason preserves it",
+			status:            "blocked",
+			failureReasonIn:   "iteration_limit",
+			wantFailureReason: "iteration_limit",
+		},
+		{
+			name:              "blocked without reason defaults to agent_error",
+			status:            "blocked",
+			failureReasonIn:   "",
+			wantFailureReason: "agent_error",
+		},
+		{
+			name:              "cancelled defaults to cancelled reason",
+			status:            "cancelled",
+			failureReasonIn:   "",
+			wantFailureReason: "cancelled",
+		},
+		{
+			name:              "unknown status fails closed",
+			status:            "weird_new_status",
+			failureReasonIn:   "",
+			wantFailureReason: "agent_error",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &reportTaskResultRecorder{}
+			srv := httptest.NewServer(rec.handler(t))
+			t.Cleanup(srv.Close)
+
+			d := &Daemon{client: NewClient(srv.URL), logger: slog.Default()}
+			d.reportTaskResult(context.Background(), "task-x", TaskResult{
+				Status:        tc.status,
+				Comment:       "rate limit reached",
+				SessionID:     "ses-x",
+				WorkDir:       "/tmp/x",
+				FailureReason: tc.failureReasonIn,
+			}, slog.Default())
+
+			rec.mu.Lock()
+			defer rec.mu.Unlock()
+			if rec.path != "/api/daemon/tasks/task-x/fail" {
+				t.Fatalf("expected /fail endpoint for status=%q, got %s", tc.status, rec.path)
+			}
+			if rec.payload["error"] != "rate limit reached" {
+				t.Errorf("error body: got %v", rec.payload["error"])
+			}
+			if got := rec.payload["failure_reason"]; got != tc.wantFailureReason {
+				t.Errorf("failure_reason: got %v, want %q", got, tc.wantFailureReason)
+			}
+			if rec.payload["session_id"] != "ses-x" {
+				t.Errorf("session_id should be forwarded on failure paths so chat resume keeps working, got %v", rec.payload["session_id"])
+			}
+		})
+	}
+}
+
+// TestHandleTask_ReportsUsageBeforeCancel verifies that ReportTaskUsage is called
+// even when the server marks the task as cancelled during the post-run status
+// check. Regression test for the ordering bug where the cancel check ran before
+// usage was reported, silently discarding accumulated tokens.
+func TestHandleTask_ReportsUsageBeforeCancel(t *testing.T) {
+	t.Parallel()
+
+	var callOrder []string
+	var mu sync.Mutex
+	recordCall := func(name string) {
+		mu.Lock()
+		callOrder = append(callOrder, name)
+		mu.Unlock()
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/start"):
+			recordCall("start")
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/progress"):
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/usage"):
+			recordCall("usage")
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/status"):
+			recordCall("status")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"cancelled"}`))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	d := &Daemon{
+		client:             NewClient(srv.URL),
+		logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		workspaces:         make(map[string]*workspaceState),
+		runtimeIndex:       map[string]Runtime{"rt-1": {ID: "rt-1", Provider: "claude"}},
+		cancelPollInterval: time.Hour, // effectively disable poll-cancel path; we want the post-run status check
+	}
+
+	// Inject a fake runner that returns a result with usage tokens, bypassing
+	// real agent process execution.
+	d.runner = taskRunnerFunc(func(_ context.Context, _ Task, _ string, _ int, _ *slog.Logger) (TaskResult, error) {
+		return TaskResult{
+			Status: "completed",
+			Usage: []TaskUsageEntry{
+				{Provider: "anthropic", Model: "claude-opus-4-6", InputTokens: 100, OutputTokens: 50},
+			},
+		}, nil
+	})
+
+	task := Task{
+		ID:        "task-abc",
+		RuntimeID: "rt-1",
+		IssueID:   "issue-xyz",
+		Agent:     &AgentData{Name: "test-agent"},
+	}
+
+	d.handleTask(context.Background(), task, 0)
+
+	mu.Lock()
+	order := make([]string, len(callOrder))
+	copy(order, callOrder)
+	mu.Unlock()
+
+	// usage must appear before status in the call order.
+	usageIdx, statusIdx := -1, -1
+	for i, name := range order {
+		switch name {
+		case "usage":
+			usageIdx = i
+		case "status":
+			statusIdx = i
+		}
+	}
+
+	if usageIdx == -1 {
+		t.Fatal("ReportTaskUsage was never called — usage is lost for cancelled tasks")
+	}
+	if statusIdx == -1 {
+		t.Fatal("GetTaskStatus was never called")
+	}
+	if usageIdx > statusIdx {
+		t.Fatalf("usage was reported AFTER status check (order: %v) — regression", order)
+	}
+}
+
+// TestHandleTask_ReportsUsageWhenCancelledByPoll verifies that ReportTaskUsage is
+// called even when the task is cancelled mid-execution by the poll goroutine.
+// Regression test for the cancelledByPoll early-return path that previously
+// discarded accumulated usage before calling ReportTaskUsage.
+func TestHandleTask_ReportsUsageWhenCancelledByPoll(t *testing.T) {
+	t.Parallel()
+
+	var callOrder []string
+	var mu sync.Mutex
+	recordCall := func(name string) {
+		mu.Lock()
+		callOrder = append(callOrder, name)
+		mu.Unlock()
+	}
+
+	// statusCallCount lets the poll goroutine return "cancelled" on first call
+	// while still handling later calls from the post-run status check.
+	var statusCallCount atomic.Int64
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/start"):
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/progress"):
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/usage"):
+			recordCall("usage")
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/status"):
+			// First call is from the poll goroutine — return "cancelled" to
+			// trigger runCancel() and close(cancelledByPoll).
+			if statusCallCount.Add(1) == 1 {
+				recordCall("poll-status")
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"status":"cancelled"}`))
+			} else {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"status":"running"}`))
+			}
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	d := &Daemon{
+		client:             NewClient(srv.URL),
+		logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		workspaces:         make(map[string]*workspaceState),
+		runtimeIndex:       map[string]Runtime{"rt-1": {ID: "rt-1", Provider: "claude"}},
+		cancelPollInterval: 10 * time.Millisecond, // fire quickly so test is fast
+	}
+
+	// Inject a runner that blocks until runCtx is cancelled (simulating a real
+	// agent being interrupted), then returns usage tokens as claude.go does.
+	d.runner = taskRunnerFunc(func(runCtx context.Context, _ Task, _ string, _ int, _ *slog.Logger) (TaskResult, error) {
+		<-runCtx.Done()
+		return TaskResult{
+			Status: "aborted",
+			Usage: []TaskUsageEntry{
+				{Provider: "anthropic", Model: "claude-opus-4-6", InputTokens: 200, OutputTokens: 80},
+			},
+		}, nil
+	})
+
+	task := Task{
+		ID:        "task-poll",
+		RuntimeID: "rt-1",
+		IssueID:   "issue-poll",
+		Agent:     &AgentData{Name: "test-agent"},
+	}
+
+	d.handleTask(context.Background(), task, 0)
+
+	mu.Lock()
+	order := make([]string, len(callOrder))
+	copy(order, callOrder)
+	mu.Unlock()
+
+	// Verify the poll goroutine actually fired — without this assertion the test
+	// could pass via the post-run GetTaskStatus check without ever taking the
+	// cancelledByPoll path, making it a vacuous regression guard.
+	pollStatusIdx := -1
+	usageIdx := -1
+	for i, name := range order {
+		switch name {
+		case "poll-status":
+			pollStatusIdx = i
+		case "usage":
+			usageIdx = i
+		}
+	}
+	if pollStatusIdx == -1 {
+		t.Fatalf("poll goroutine never fired (order: %v) — cancelledByPoll path not exercised", order)
+	}
+	if usageIdx == -1 {
+		t.Fatalf("ReportTaskUsage was never called on poll-cancelled path (order: %v) — tokens lost", order)
+	}
+	// poll-status must precede usage: poll fires → runCtx cancelled → runner unblocks → usage flushed.
+	// If usage comes first, usage was reported before the runner was interrupted, which is impossible
+	// given that the runner blocks on runCtx.Done().
+	if usageIdx < pollStatusIdx {
+		t.Fatalf("usage reported before poll-status (order: %v) — poll-status must come first", order)
 	}
 }
