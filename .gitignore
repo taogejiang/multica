@@ -16,6 +16,7 @@ dist-electron
 # config files (entitlements, icons) — not build output.
 !apps/desktop/build/
 !apps/desktop/build/**
+__pycache__/
 
 # env
 .env*
@@ -45,6 +46,7 @@ server/multica
 # Test artifacts
 test-results/
 apps/web/test-results/
+.pytest_cache/
 
 # context (agent workspace)
 .context
@@ -60,6 +62,7 @@ _features/
 
 # runtime
 *.pid
+.venv/
 
 # platform specific
 *.dmg
