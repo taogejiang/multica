@@ -352,7 +352,13 @@ func (s *EmailService) SendVerificationCode(to, code string) error {
 // SendInvitationEmail notifies the invitee that they have been invited to a workspace.
 // invitationID is included in the URL so the email deep-links to /invite/{id}.
 func (s *EmailService) SendInvitationEmail(to, inviterName, workspaceName, invitationID string) error {
-	appURL := strings.TrimSpace(os.Getenv("FRONTEND_ORIGIN"))
+	// Prefer MULTICA_APP_URL (includes basePath, e.g. /multica) over
+	// FRONTEND_ORIGIN (origin only) so self-hosted deployments behind a
+	// sub-path generate correct deep-links like /multica/invite/{id}.
+	appURL := strings.TrimSpace(os.Getenv("MULTICA_APP_URL"))
+	if appURL == "" {
+		appURL = strings.TrimSpace(os.Getenv("FRONTEND_ORIGIN"))
+	}
 	if appURL == "" {
 		appURL = "https://app.multica.ai"
 	}
