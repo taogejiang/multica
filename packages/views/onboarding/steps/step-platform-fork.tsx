@@ -2,11 +2,6 @@
 
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { ArrowLeft, ArrowRight, Download } from "lucide-react";
-import {
-  captureDownloadIntent,
-  captureEvent,
-  setPersonProperties,
-} from "@multica/core/analytics";
 import { Button } from "@multica/ui/components/ui/button";
 import {
   Dialog,
@@ -19,6 +14,7 @@ import {
 import { useScrollFade } from "@multica/ui/hooks/use-scroll-fade";
 import { cn } from "@multica/ui/lib/utils";
 import type { AgentRuntime } from "@multica/core/types";
+import { runtimeDisplayLabel } from "@multica/core/runtimes";
 import { DragStrip } from "@multica/views/platform";
 import { StepHeader } from "../components/step-header";
 import { RuntimeAsidePanel } from "../components/runtime-aside-panel";
@@ -74,47 +70,15 @@ export function StepPlatformFork({
   const [dialog, setDialog] = useState<DialogState>(null);
   const [downloaded, setDownloaded] = useState(false);
 
-  // Platform signal retained purely for PostHog dimensions — the UI
-  // no longer branches on it (Windows / Linux desktop installers now
-  // ship, so all three platforms get the same card). Computed
-  // lazily; SSR-safe because handlers only run client-side.
-  const isMac =
-    typeof navigator !== "undefined" &&
-    (/Mac|iPhone|iPad|iPod/i.test(navigator.platform || "") ||
-      /Mac OS X/i.test(navigator.userAgent || ""));
-
   const picker = useRuntimePicker(wsId);
 
   const pickDesktop = () => {
     window.open(DOWNLOAD_PAGE_URL, "_blank", "noopener,noreferrer");
     setDownloaded(true);
-    // Step-3-scoped path selection event (kept for existing funnels);
-    // `source: "step3"` future-proofs if the event is reused from
-    // another surface later.
-    captureEvent("onboarding_runtime_path_selected", {
-      workspace_id: wsId,
-      path: "download_desktop",
-      source: "onboarding",
-      surface: "step3",
-      is_mac: isMac,
-    });
-    // Cross-surface Desktop intent event — also fires from landing
-    // hero / footer / login / Welcome. Enables the top-of-funnel
-    // split without retrofitting `onboarding_runtime_path_selected`
-    // to non-onboarding contexts.
-    captureDownloadIntent("step3");
   };
 
   const handleOpenCli = () => {
     setDialog("cli");
-    captureEvent("onboarding_runtime_path_selected", {
-      workspace_id: wsId,
-      path: "cli",
-      source: "onboarding",
-      surface: "step3",
-      is_mac: isMac,
-    });
-    setPersonProperties({ platform_preference: "web" });
   };
 
   const handleCliConnect = () => {
@@ -141,7 +105,7 @@ export function StepPlatformFork({
             <button
               type="button"
               onClick={onBack}
-              className="flex items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground"
+              className="flex items-center gap-1.5 text-body text-muted-foreground transition-colors hover:text-foreground"
             >
               <ArrowLeft className="h-3.5 w-3.5" />
               {t(($) => $.common.back)}
@@ -160,13 +124,13 @@ export function StepPlatformFork({
           className="min-h-0 flex-1 overflow-y-auto"
         >
           <div className="mx-auto w-full max-w-[620px] px-6 py-10 sm:px-10 md:px-14 lg:px-0 lg:py-14">
-            <div className="mb-2 text-xs font-medium uppercase tracking-[0.08em] text-muted-foreground">
+            <div className="mb-2 text-caption font-medium uppercase tracking-[0.08em] text-muted-foreground">
               {t(($) => $.step_platform.eyebrow)}
             </div>
-            <h1 className="text-balance font-serif text-[36px] font-medium leading-[1.1] tracking-tight text-foreground">
+            <h1 className="text-balance font-serif text-display font-medium leading-[1.1] tracking-tight text-foreground">
               {t(($) => $.step_platform.headline)}
             </h1>
-            <p className="mt-4 max-w-[560px] text-[15.5px] leading-[1.55] text-muted-foreground">
+            <p className="mt-4 max-w-[560px] text-body-lg leading-[1.55] text-muted-foreground">
               {t(($) => $.step_platform.lede)}
             </p>
 
@@ -195,7 +159,7 @@ export function StepPlatformFork({
             <div className="mt-8 flex max-w-[560px] flex-wrap items-center justify-between gap-x-4 gap-y-2">
               <span
                 aria-live="polite"
-                className="text-xs text-muted-foreground"
+                className="text-caption text-muted-foreground"
               >
                 {footerHint}
               </span>
@@ -224,7 +188,9 @@ export function StepPlatformFork({
         onSelect={picker.setSelectedId}
         hasRuntimes={picker.hasRuntimes}
         canConnect={picker.selected !== null}
-        selectedName={picker.selected?.name ?? null}
+        selectedName={
+          picker.selected ? runtimeDisplayLabel(picker.selected) : null
+        }
         cliInstructions={cliInstructions}
       />
     </div>
@@ -253,13 +219,13 @@ function ForkPrimary({
       )}
     >
       <div className="min-w-0">
-        <div className="flex items-center gap-2 text-[17px] font-medium tracking-tight">
+        <div className="flex items-center gap-2 text-title font-medium tracking-tight">
           <Download className="h-4 w-4" aria-hidden />
           {downloaded
             ? t(($) => $.step_platform.download_title_after)
             : t(($) => $.step_platform.download_title)}
         </div>
-        <div className="mt-1 text-[13px] text-background/60">
+        <div className="mt-1 text-label text-background/60">
           {downloaded
             ? t(($) => $.step_platform.download_subtitle_after)
             : t(($) => $.step_platform.download_subtitle)}
@@ -267,7 +233,7 @@ function ForkPrimary({
       </div>
       <span
         aria-hidden
-        className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-background/10 px-4 py-2 text-[13px] font-medium transition-colors group-hover:bg-background/20"
+        className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-background/10 px-4 py-2 text-label font-medium transition-colors group-hover:bg-background/20"
       >
         {t(($) => $.step_platform.download_button)}
         <ArrowRight className="h-3.5 w-3.5" />
@@ -303,13 +269,13 @@ function ForkAlt({
       )}
     >
       <div className="min-w-0">
-        <div className="text-[14.5px] font-medium text-foreground">{title}</div>
-        <div className="mt-1 text-[12.5px] leading-[1.5] text-muted-foreground">
+        <div className="text-body font-medium text-foreground">{title}</div>
+        <div className="mt-1 text-caption leading-[1.5] text-muted-foreground">
           {subtitle}
         </div>
       </div>
       {disabled ? (
-        <span className="shrink-0 rounded-full border bg-muted px-3 py-1 text-[12px] font-medium text-muted-foreground">
+        <span className="shrink-0 rounded-full border bg-muted px-3 py-1 text-caption font-medium text-muted-foreground">
           {actionLabel}
         </span>
       ) : (
@@ -376,7 +342,7 @@ function CliInstallDialog({
 
           {hasRuntimes ? (
             <>
-              <div className="flex items-center gap-2 pt-1 text-sm">
+              <div className="flex items-center gap-2 pt-1 text-body">
                 <div className="h-2 w-2 rounded-full bg-success" />
                 <span className="font-medium">
                   {t(($) => $.step_platform.runtimes_connected, { count: runtimes.length })}
@@ -406,7 +372,7 @@ function CliInstallDialog({
               one" / "selected X". While still waiting, the body's
               CliWaitingStatus already conveys the live-listening state,
               so an additional "Waiting..." footer line is duplication. */}
-          <span className="text-xs text-muted-foreground">
+          <span className="text-caption text-muted-foreground">
             {hasRuntimes
               ? canConnect && selectedName
                 ? t(($) => $.step_runtime.hint_selected, { name: selectedName })
@@ -493,7 +459,7 @@ function CliWaitingStatus({ dialogOpen }: { dialogOpen: boolean }) {
 
   return (
     <div className="flex flex-col gap-3 rounded-lg border bg-muted/30 p-4">
-      <div className="flex items-center gap-2 text-sm">
+      <div className="flex items-center gap-2 text-body">
         {/* Pulsing green dot signals active WS subscription — the
             useRuntimePicker hook is already subscribed to `daemon:register`,
             this is the visual confirmation that "we're listening". */}
@@ -504,14 +470,14 @@ function CliWaitingStatus({ dialogOpen }: { dialogOpen: boolean }) {
         <span className="font-medium text-foreground">
           {t(($) => $.step_platform.live_listening)}
         </span>
-        <span className="ml-auto font-mono text-xs tabular-nums text-muted-foreground">
+        <span className="ml-auto font-mono text-caption tabular-nums text-muted-foreground">
           {formatElapsed(elapsed)}
         </span>
       </div>
 
       <p
         aria-live="polite"
-        className="text-[12.5px] leading-[1.55] text-muted-foreground"
+        className="text-caption leading-[1.55] text-muted-foreground"
       >
         {stage === "normal" && (
           <>

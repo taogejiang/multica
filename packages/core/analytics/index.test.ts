@@ -106,87 +106,6 @@ describe("resetAnalytics", () => {
   });
 });
 
-describe("normalizePageviewPath", () => {
-  it("collapses resource-id segments to the section route", async () => {
-    const { analytics } = await loadModule();
-    expect(
-      analytics.normalizePageviewPath("/acme/issues/8d5c1a2b-0035-4c62-9f14-1ad4215736a5"),
-    ).toBe("/acme/issues");
-    expect(analytics.normalizePageviewPath("/acme/issues/MUL-123")).toBe("/acme/issues");
-    expect(
-      analytics.normalizePageviewPath("/invite/8d5c1a2b-0035-4c62-9f14-1ad4215736a5"),
-    ).toBe("/invite");
-  });
-
-  it("strips query string and hash", async () => {
-    const { analytics } = await loadModule();
-    expect(analytics.normalizePageviewPath("/acme/issues?status=open&view=board")).toBe(
-      "/acme/issues",
-    );
-    expect(analytics.normalizePageviewPath("/acme/issues#section")).toBe("/acme/issues");
-  });
-
-  it("keeps non-id sub-sections and never drops the leading segment", async () => {
-    const { analytics } = await loadModule();
-    expect(analytics.normalizePageviewPath("/acme/settings/members")).toBe(
-      "/acme/settings/members",
-    );
-    // A workspace slug that looks like an issue key must not be dropped.
-    expect(analytics.normalizePageviewPath("/team-1/issues/MUL-9")).toBe("/team-1/issues");
-    expect(analytics.normalizePageviewPath("/login")).toBe("/login");
-    expect(analytics.normalizePageviewPath("/")).toBe("/");
-  });
-});
-
-describe("capturePageview", () => {
-  function captureMock(posthog: unknown) {
-    return (posthog as { capture: ReturnType<typeof vi.fn> }).capture;
-  }
-
-  it("emits the section-normalized path as $current_url", async () => {
-    const { analytics, posthog } = await loadModule();
-    analytics.initAnalytics({ key: "k", host: "" });
-    const capture = captureMock(posthog);
-    capture.mockClear();
-
-    analytics.capturePageview("/acme/issues/8d5c1a2b-0035-4c62-9f14-1ad4215736a5");
-
-    expect(capture).toHaveBeenCalledTimes(1);
-    expect(capture).toHaveBeenCalledWith("$pageview", { $current_url: "/acme/issues" });
-  });
-
-  it("dedupes consecutive views of the same section but fires on section change", async () => {
-    const { analytics, posthog } = await loadModule();
-    analytics.initAnalytics({ key: "k", host: "" });
-    const capture = captureMock(posthog);
-    capture.mockClear();
-
-    // Two different issues collapse to the same section → one event.
-    analytics.capturePageview("/acme/issues/a1b2c3d4-0035-4c62-9f14-1ad4215736a5");
-    analytics.capturePageview("/acme/issues/b2c3d4e5-0035-4c62-9f14-1ad4215736a5");
-    expect(capture).toHaveBeenCalledTimes(1);
-
-    // A real section change fires again.
-    analytics.capturePageview("/acme/projects");
-    expect(capture).toHaveBeenCalledTimes(2);
-  });
-
-  it("re-emits the same section after resetAnalytics clears the dedup state", async () => {
-    const { analytics, posthog } = await loadModule();
-    analytics.initAnalytics({ key: "k", host: "" });
-    const capture = captureMock(posthog);
-    capture.mockClear();
-
-    analytics.capturePageview("/acme/inbox");
-    analytics.capturePageview("/acme/inbox");
-    expect(capture).toHaveBeenCalledTimes(1);
-
-    analytics.resetAnalytics();
-    analytics.capturePageview("/acme/inbox");
-    expect(capture).toHaveBeenCalledTimes(2);
-  });
-});
-
 describe("captureException", () => {
   it("buffers a pre-init exception and flushes it on init", async () => {
     const { analytics, posthog } = await loadModule();
@@ -214,5 +133,77 @@ describe("captureException", () => {
     analytics.captureException(err);
     expect(posthog.captureException).toHaveBeenCalledTimes(1);
     expect(posthog.captureException).toHaveBeenCalledWith(err, expect.any(Object));
+  });
+});
+
+describe("before_send $exception pipeline", () => {
+  // before_send is registered inside posthog.init's config; pull it back out of
+  // the mock and drive it directly. Dedupe needs a working sessionStorage.
+  function makeMemoryStorage() {
+    const data = new Map<string, string>();
+    return {
+      getItem: (k: string) => (data.has(k) ? data.get(k)! : null),
+      setItem: (k: string, v: string) => void data.set(k, v),
+      removeItem: (k: string) => void data.delete(k),
+      clear: () => data.clear(),
+      key: (i: number) => Array.from(data.keys())[i] ?? null,
+      get length() {
+        return data.size;
+      },
+    };
+  }
+
+  type BeforeSend = (
+    e: { event: string; properties: Record<string, unknown> } | null,
+  ) => unknown;
+
+  function getBeforeSend(posthog: { init: ReturnType<typeof vi.fn> }): BeforeSend {
+    const config = posthog.init.mock.calls[0]?.[1] as { before_send: BeforeSend };
+    return config.before_send;
+  }
+
+  function excEvent() {
+    return {
+      event: "$exception",
+      properties: {
+        $exception_list: [
+          {
+            type: "TypeError",
+            value: "Bad email bob@corp.com",
+            stacktrace: {
+              frames: [{ filename: "a.tsx", function: "f", lineno: 1, colno: 2 }],
+            },
+          },
+        ],
+      },
+    };
+  }
+
+  beforeEach(() => {
+    vi.stubGlobal("sessionStorage", makeMemoryStorage());
+  });
+
+  it("redacts the message, then drops repeats past the per-fingerprint limit", async () => {
+    const { analytics, posthog } = await loadModule();
+    analytics.initAnalytics({ key: "k", host: "" });
+    const beforeSend = getBeforeSend(posthog);
+
+    const first = beforeSend(excEvent()) as { properties: { $exception_list: Array<{ value: string }> } };
+    // Redaction still runs before the fuse.
+    expect(first.properties.$exception_list[0]!.value).toBe("Bad email [redacted]");
+
+    expect(beforeSend(excEvent())).not.toBeNull();
+    expect(beforeSend(excEvent())).not.toBeNull();
+    // 4th identical exception is dropped.
+    expect(beforeSend(excEvent())).toBeNull();
+  });
+
+  it("passes non-$exception events through untouched", async () => {
+    const { analytics, posthog } = await loadModule();
+    analytics.initAnalytics({ key: "k", host: "" });
+    const beforeSend = getBeforeSend(posthog);
+
+    const evt = { event: "$pageview", properties: { $current_url: "/acme/issues" } };
+    expect(beforeSend(evt)).toBe(evt);
   });
 });

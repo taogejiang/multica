@@ -14,9 +14,11 @@
  * v1 simplifications:
  *   - No "Replied in Ns" badge under assistant bubbles (elapsed_ms is
  *     parsed but not displayed). Easy v2 add — show below the bubble.
- *   - No attachment card rendering. Attachments embedded as
- *     `![](url)` / `[name](url)` in `content` flow through the existing
- *     markdown renderer.
+ *   - Attachments bound to a message but NOT referenced inline in `content`
+ *     render as standalone cards below the bubble via `CommentAttachmentList`
+ *     (same component the comment thread uses; mirrors web reusing
+ *     `AttachmentList` in chat). Inline `![](url)` / `[name](url)` still flow
+ *     through the markdown renderer and are de-duped out of the card list.
  *
  * Interaction: long-press inside a bubble fires a native iOS
  * `ActionSheetIOS` (Copy / Select Text / Cancel). While the sheet is on
@@ -38,6 +40,7 @@
  * `startRenderingFromBottom` (initial paint at bottom, no setTimeout
  * hacks). Cell recycling also keeps scroll-up smooth.
  */
+import { useState } from "react";
 import { ActivityIndicator, Pressable, View } from "react-native";
 import { FlashList } from "@shopify/flash-list";
 import { Ionicons } from "@expo/vector-icons";
@@ -45,6 +48,7 @@ import { useQuery } from "@tanstack/react-query";
 import type {
   ChatMessage,
   ChatPendingTask,
+  ChatQuickAction,
   TaskMessagePayload,
 } from "@multica/core/types";
 import type { AgentAvailability } from "@multica/core/agents";
@@ -58,6 +62,10 @@ import { useChatSelectStore } from "@/data/chat-select-store";
 import { useChatMessageLongPress } from "./message-long-press";
 import { ChatEmptyState } from "./chat-empty-state";
 import { ChatTimeline } from "./chat-timeline";
+// Reuse the comment thread's standalone attachment list — same design web
+// reuses in chat (AttachmentList). Renders any bound attachment not already
+// referenced inline in the message content, with same-file dedup.
+import { CommentAttachmentList } from "@/components/issue/comment-attachment-list";
 import { StatusPill } from "./status-pill";
 import {
   Collapsible,
@@ -76,6 +84,9 @@ interface Props {
    *  (or focuses the composer with the text) — empty state stays neutral
    *  about send vs. preview. */
   onPickPrompt: (text: string) => void;
+  /** Send a persisted assistant follow-up without first copying it into draft. */
+  onQuickAction?: (action: ChatQuickAction) => void | Promise<unknown>;
+  quickActionsDisabled?: boolean;
   /** Server-authoritative pending-task snapshot for the active session.
    *  Used to render the live timeline + status line as the last item in
    *  the message stream, mirroring web's
@@ -95,6 +106,8 @@ export function ChatMessageList({
   hasSessions,
   agentName,
   onPickPrompt,
+  onQuickAction,
+  quickActionsDisabled = false,
   pendingTask,
   liveTaskMessages,
   availability,
@@ -166,7 +179,13 @@ export function ChatMessageList({
       key={messages[0]?.id ?? "empty"}
       data={messages}
       keyExtractor={(m) => m.id}
-      renderItem={({ item }) => <MessageRow message={item} />}
+      renderItem={({ item }) => (
+        <MessageRow
+          message={item}
+          onQuickAction={onQuickAction}
+          quickActionsDisabled={quickActionsDisabled}
+        />
+      )}
       ItemSeparatorComponent={MessageSeparator}
       ListFooterComponent={
         showLiveSection ? (
@@ -220,7 +239,15 @@ function MessageSeparator() {
   return <View style={{ height: 12 }} />;
 }
 
-function MessageRow({ message }: { message: ChatMessage }) {
+function MessageRow({
+  message,
+  onQuickAction,
+  quickActionsDisabled,
+}: {
+  message: ChatMessage;
+  onQuickAction?: (action: ChatQuickAction) => void | Promise<unknown>;
+  quickActionsDisabled: boolean;
+}) {
   const isUser = message.role === "user";
   const isFailure = !!message.failure_reason;
   const isSelecting = useChatSelectStore(
@@ -250,7 +277,7 @@ function MessageRow({ message }: { message: ChatMessage }) {
     const body = (
       <View
         className={cn(
-          "self-end max-w-[80%] rounded-2xl border-2 px-3.5 py-2 transition-colors",
+          "self-end max-w-[80%] gap-1.5 rounded-2xl border-2 px-3.5 py-2 transition-colors",
           isSelecting
             ? "bg-primary/5 border-primary/30"
             : longPress.isPressed
@@ -263,6 +290,10 @@ function MessageRow({ message }: { message: ChatMessage }) {
           attachments={message.attachments}
           selectable={isSelecting}
           compact
+        />
+        <CommentAttachmentList
+          attachments={message.attachments}
+          content={message.content}
         />
       </View>
     );
@@ -284,6 +315,8 @@ function MessageRow({ message }: { message: ChatMessage }) {
       message={message}
       isSelecting={isSelecting}
       longPress={longPress}
+      onQuickAction={onQuickAction}
+      quickActionsDisabled={quickActionsDisabled}
     />
   );
 }
@@ -306,10 +339,14 @@ function AssistantRow({
   message,
   isSelecting,
   longPress,
+  onQuickAction,
+  quickActionsDisabled,
 }: {
   message: ChatMessage;
   isSelecting: boolean;
   longPress: ReturnType<typeof useChatMessageLongPress>;
+  onQuickAction?: (action: ChatQuickAction) => void | Promise<unknown>;
+  quickActionsDisabled: boolean;
 }) {
   // Read the cached timeline if any. `enabled` (in taskMessagesOptions) is
   // gated on isTaskMessageTaskId — optimistic id prefixes never fetch, so
@@ -319,26 +356,123 @@ function AssistantRow({
   const { data: timeline = [] } = useQuery(
     taskMessagesOptions(message.task_id),
   );
+  // no_response (MUL-4351, mirrors packages/views AssistantMessage): the agent
+  // completed this turn without text. Keep the tool timeline and show a notice
+  // instead of an empty Markdown block; caption reads "Finished in" not
+  // "Replied in".
+  const isNoResponse = message.message_kind === "no_response";
   const body = (
     <View className="gap-1.5">
       {timeline.length > 0 ? (
         <ChatTimeline items={timeline} />
       ) : null}
-      <Markdown
-        content={message.content}
+      {isNoResponse ? (
+        <Text className="text-sm italic text-muted-foreground">
+          The agent finished this turn without a text reply.
+        </Text>
+      ) : (
+        <Markdown
+          content={message.content}
+          attachments={message.attachments}
+          selectable={isSelecting}
+        />
+      )}
+      {/* Standalone attachment cards for anything not referenced inline. An
+          image-only reply is a real ('message') outcome with empty content, so
+          it flows through the else-branch above (renders nothing) and the cards
+          here ARE the reply. */}
+      <CommentAttachmentList
         attachments={message.attachments}
-        selectable={isSelecting}
+        content={message.content}
       />
       {message.elapsed_ms != null ? (
-        <ElapsedCaption variant="replied" elapsedMs={message.elapsed_ms} />
+        <ElapsedCaption
+          variant={isNoResponse ? "finished" : "replied"}
+          elapsedMs={message.elapsed_ms}
+        />
       ) : null}
     </View>
   );
-  if (isSelecting) return body;
-  return (
+  const messageBody = isSelecting ? body : (
     <Pressable onLongPress={longPress.onLongPress} delayLongPress={500}>
       {body}
     </Pressable>
+  );
+  if (!onQuickAction || (message.quick_actions?.length ?? 0) === 0) {
+    return messageBody;
+  }
+  return (
+    <View className="gap-2">
+      {messageBody}
+      <QuickActions
+        actions={message.quick_actions ?? []}
+        disabled={quickActionsDisabled}
+        onSelect={onQuickAction}
+      />
+    </View>
+  );
+}
+
+function QuickActions({
+  actions,
+  disabled,
+  onSelect,
+}: {
+  actions: ChatQuickAction[];
+  disabled: boolean;
+  onSelect: (action: ChatQuickAction) => void | Promise<unknown>;
+}) {
+  const [submitting, setSubmitting] = useState(false);
+  const blocked = disabled || submitting;
+
+  const handleSelect = async (action: ChatQuickAction) => {
+    if (blocked) return;
+    setSubmitting(true);
+    try {
+      await onSelect(action);
+    } catch {
+      // The send path rolls back its optimistic message. Keep the action usable
+      // so a transient request failure can be retried.
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <View
+      className="flex-row flex-wrap gap-2 pt-0.5"
+      accessibilityLabel="Suggested follow-ups"
+    >
+      {actions.slice(0, 3).map((action, index) => (
+        <Pressable
+          key={`${action.label}-${index}`}
+          accessibilityRole="button"
+          accessibilityState={{ disabled: blocked }}
+          disabled={blocked}
+          onPress={() => void handleSelect(action)}
+          className={cn(
+            "min-h-10 max-w-full flex-row items-center gap-1 rounded-full border px-3 active:opacity-70",
+            action.primary
+              ? "border-primary/30 bg-primary/10"
+              : "border-border bg-background",
+            blocked && "opacity-50",
+          )}
+        >
+          <Text
+            numberOfLines={1}
+            className={cn(
+              "shrink text-sm font-medium",
+              action.primary ? "text-primary" : "text-foreground",
+            )}
+          >
+            {action.label}
+          </Text>
+          {action.primary ? (
+            <Text className="text-sm font-medium text-primary">↗</Text>
+          ) : null}
+        </Pressable>
+      ))}
+    </View>
   );
 }
 
@@ -349,13 +483,15 @@ function ElapsedCaption({
   variant,
   elapsedMs,
 }: {
-  variant: "replied" | "failed";
+  variant: "replied" | "failed" | "finished";
   elapsedMs: number;
 }) {
   const label =
     variant === "replied"
       ? `Replied in ${formatElapsedMs(elapsedMs)}`
-      : `Failed after ${formatElapsedMs(elapsedMs)}`;
+      : variant === "finished"
+        ? `Finished in ${formatElapsedMs(elapsedMs)}`
+        : `Failed after ${formatElapsedMs(elapsedMs)}`;
   return (
     <Text className="text-xs text-muted-foreground/80 mt-1">{label}</Text>
   );

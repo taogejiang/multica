@@ -4,6 +4,47 @@ export type AgentRuntimeMode = "local" | "cloud";
 
 export type AgentVisibility = "workspace" | "private";
 
+// ---------------------------------------------------------------------------
+// Agent invocation permissions (MUL-3963)
+//
+// `permission_mode` + `invocation_targets` are the AUTHORITATIVE gate for who
+// may TRIGGER / assign / @mention / chat an agent. The legacy `visibility`
+// field REMAINS but is now DERIVED on the backend from these two: a
+// `public_to` agent WITH a workspace target maps to `visibility: "workspace"`;
+// everything else (private, or public_to scoped only to member/team targets)
+// maps to `visibility: "private"`.
+//
+// Invocation semantics:
+//   - owner: always
+//   - permission_mode "private": ONLY the owner (workspace admins no longer
+//     bypass — the key behavior change vs the old visibility model)
+//   - permission_mode "public_to" + workspace target: any workspace member
+//   - permission_mode "public_to" + member target: only the matching user
+//   - team target: reserved, INERT in v1 (never grants)
+// ---------------------------------------------------------------------------
+
+export type AgentPermissionMode = "private" | "public_to";
+
+/**
+ * A single invocation grant on an agent. `target_id` is `null` for the
+ * workspace target (the grant covers every workspace member); it carries the
+ * member / team id for the scoped grants.
+ */
+export interface AgentInvocationTarget {
+  target_type: "workspace" | "member" | "team";
+  target_id: string | null;
+}
+
+/**
+ * Wire shape for invocation targets on CREATE / UPDATE requests. For a
+ * workspace target the client may omit `target_id` (the backend fills the
+ * workspace id); member / team targets REQUIRE it.
+ */
+export interface AgentInvocationTargetInput {
+  target_type: "workspace" | "member" | "team";
+  target_id?: string;
+}
+
 // Runtime visibility is a separate axis from agent visibility — different
 // vocabulary because it gates a different action. "private" (default) means
 // only the runtime owner and workspace admins can bind agents to it;
@@ -17,6 +58,13 @@ export interface RuntimeDevice {
   workspace_id: string;
   daemon_id: string | null;
   name: string;
+  /**
+   * Optional user-set display name override (MUL-4217). Overrides `name` for
+   * display; the daemon never writes it, so it survives heartbeats. Older
+   * backends omit the field — consumers must treat missing / empty as "use
+   * name" (see runtimeDisplayName).
+   */
+  custom_name?: string | null;
   runtime_mode: AgentRuntimeMode;
   provider: string;
   launch_header: string;
@@ -26,12 +74,101 @@ export interface RuntimeDevice {
   owner_id: string | null;
   /** Defaults to "private" when the backend predates the visibility flag. */
   visibility: RuntimeVisibility;
+  /**
+   * The custom runtime profile this registered runtime was launched from,
+   * or `null` for a built-in protocol family. The UI uses this to stamp a
+   * "Built-in" vs "Custom" badge on the runtime row. Older backends that
+   * predate the custom-runtime feature omit the field; consumers must treat
+   * a missing value as `null` (built-in).
+   */
+  profile_id?: string | null;
   last_seen_at: string | null;
   created_at: string;
   updated_at: string;
 }
 
 export type AgentRuntime = RuntimeDevice;
+
+// ---------------------------------------------------------------------------
+// Custom runtime profiles (MUL-3284)
+//
+// A RuntimeProfile is a workspace-level *definition* of a custom runtime
+// backend — distinct from a RuntimeDevice, which is a daemon-registered
+// *instance*. An admin authors a profile (display name + base protocol
+// family + the CLI command to launch), and daemons can then register
+// runtimes against it; those instances carry `profile_id` pointing back here.
+// ---------------------------------------------------------------------------
+
+// The fixed allow-list of base protocol families a custom runtime can wrap.
+// These are the only backends the create flow may select; the server rejects
+// anything else with 400. Kept as a const tuple so the union type is derived
+// from the single source of truth.
+export const RUNTIME_PROFILE_PROTOCOL_FAMILIES = [
+  "claude",
+  "codebuddy",
+  "codex",
+  "copilot",
+  "opencode",
+  "deveco",
+  "openclaw",
+  "hermes",
+  "pi",
+  "cursor",
+  "kimi",
+  "kiro",
+  "antigravity",
+  "qoder",
+  "qoderclicn",
+  "traecli",
+  "grok",
+  "qwen",
+] as const;
+
+export type RuntimeProtocolFamily =
+  (typeof RUNTIME_PROFILE_PROTOCOL_FAMILIES)[number];
+
+// Profile visibility mirrors RuntimeVisibility's vocabulary but uses the
+// workspace/private axis the server documents for profiles.
+export type RuntimeProfileVisibility = "workspace" | "private";
+
+export interface RuntimeProfile {
+  id: string;
+  workspace_id: string;
+  display_name: string;
+  protocol_family: RuntimeProtocolFamily;
+  command_name: string;
+  description: string | null;
+  fixed_args: string[];
+  visibility: RuntimeProfileVisibility;
+  created_by: string | null;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+// POST body. `protocol_family` is required and immutable after creation.
+// Optional fields are omitted entirely when unset (never sent as null/empty)
+// so the server applies its own defaults.
+export interface CreateRuntimeProfileRequest {
+  display_name: string;
+  protocol_family: RuntimeProtocolFamily;
+  command_name: string;
+  description?: string;
+  fixed_args?: string[];
+  visibility?: RuntimeProfileVisibility;
+  enabled?: boolean;
+}
+
+// PATCH body — every field optional; `protocol_family` is intentionally
+// absent because it is immutable.
+export interface UpdateRuntimeProfileRequest {
+  display_name?: string;
+  command_name?: string;
+  description?: string | null;
+  fixed_args?: string[];
+  visibility?: RuntimeProfileVisibility;
+  enabled?: boolean;
+}
 
 // Coarse classifier set by the backend when a task transitions to "failed".
 // Mirrors the migration-055 enum in agent_task_queue.failure_reason. Used by
@@ -60,6 +197,71 @@ export interface AgentActivityBucket {
 export interface AgentRunCount {
   agent_id: string;
   run_count: number;
+}
+
+// Privacy-safe display summary returned by GET /api/working-agents. The
+// endpoint is workspace-scoped and includes each user-authored agent with at
+// least one running task exactly once.
+export interface WorkspaceWorkingAgent {
+  id: string;
+  name: string;
+  avatar_url: string | null;
+  running_task_count: number;
+  /** Distinct issues referenced by this agent's currently running tasks after
+   *  applying the endpoint's type/scope/relation filters. */
+  issue_ids: string[];
+}
+
+export type WorkspaceWorkingAgentType = "issue" | "autopilot" | "chat";
+
+export type WorkspaceWorkingAgentMineRelation =
+  | "assigned"
+  | "created"
+  | "involved"
+  | "any";
+
+/**
+ * A departed-member-safe user ref resolved from the global user table. `name` /
+ * `email` / `avatar_url` are absent until the server hydrates them (present on
+ * user-facing task surfaces). Render defensively — fall back to a generic label
+ * when only `id` is available. See MUL-4302 §9.
+ */
+export interface AttributionUser {
+  id: string;
+  name?: string;
+  email?: string;
+  avatar_url?: string;
+}
+
+/** The kind-tagged handle to a run's direct cause (comment, autopilot run, ...). */
+export interface TaskEvidence {
+  kind: string;
+  ref_id: string;
+}
+
+/**
+ * The resolved accountable-human provenance of an agent run (MUL-4302 §9). Free-text
+ * `source` (server may add new levels), so switch on it with a default branch.
+ */
+export interface TaskAttribution {
+  /**
+   * Waterfall level that resolved the accountable human:
+   * `direct_human` | `delegation` | `comment_source` | `rule_owner` |
+   * `owner_fallback` | `backfill` | `unattributed`. Never blank.
+   */
+  source: string;
+  /** False for degraded sources (owner_fallback / backfill / unattributed). */
+  precise: boolean;
+  /** The accountable human ("on behalf of"). Absent when unattributed. */
+  initiator?: AttributionUser;
+  /** The authorization human; absent for autopilot runs (rule_owner / owner_fallback). */
+  originator?: AttributionUser;
+  /** The direct cause of the run, for a jump-to-evidence affordance. */
+  evidence?: TaskEvidence;
+  rule_version_id?: string;
+  delegated_from_task_id?: string;
+  retry_of_task_id?: string;
+  rerun_of_task_id?: string;
 }
 
 export interface AgentTask {
@@ -104,6 +306,21 @@ export interface AgentTask {
   /** Set when an issue comment triggered this task (@mention or assignee comment). */
   trigger_comment_id?: string;
   /**
+   * Earlier comment IDs folded into this run before it was claimed. This does
+   * not include `trigger_comment_id`, which remains the run's newest trigger.
+   * Their unique union is the queued coverage plan; claimed-task consumers
+   * should prefer `delivered_comment_ids` when that receipt is present. Omitted
+   * by older backends and for runs that were not merged.
+   */
+  coalesced_comment_ids?: string[];
+  /**
+   * Comment IDs actually embedded in the task's latest claim response. Once a
+   * task has left queued state this is the authoritative coverage receipt.
+   * Omitted by older backends, where consumers may fall back to the planned
+   * trigger/coalesced union; an explicitly empty array is still authoritative.
+   */
+  delivered_comment_ids?: string[];
+  /**
    * Canonical short description of what triggered this task — snapshot
    * taken at creation time. For comment-triggered tasks it's the
    * comment text (truncated to ~200 chars); for autopilot it's the
@@ -112,6 +329,13 @@ export interface AgentTask {
    * or deleted.
    */
   trigger_summary?: string;
+  /**
+   * Handoff instruction the assigner attached when starting this run (MUL-3375).
+   * Present only on assignment-triggered runs that carried a note; the execution
+   * log shows it inline as the trigger reason. Absent (legacy / no note) falls
+   * back to the generic "initial run" label.
+   */
+  handoff_note?: string;
   /**
    * Server-computed source discriminator used by the activity row to label
    * tasks that have no linked issue (so e.g. quick-create tasks render
@@ -138,12 +362,27 @@ export interface AgentTask {
    * shares and screenshots also stay safe).
    */
   relative_work_dir?: string;
+  /**
+   * Resolved accountable-human provenance of this run (MUL-4302 §9): who it ran
+   * "on behalf of", how that was resolved, and the evidence/lineage. Present on
+   * user-facing task surfaces; older backends omit it — render conditionally.
+   */
+  attribution?: TaskAttribution;
 }
 
 export interface Agent {
   id: string;
   workspace_id: string;
+  /**
+   * Empty string when the agent is unbound: it kept its configuration, chats and
+   * task history when its runtime was deleted, and needs a new runtime before it
+   * can run again (MUL-5559). Use `isAgentRuntimeBound` so additive and legacy
+   * signals stay compatible, and do not confuse it with a bound-but-offline
+   * runtime — that one just needs the machine back.
+   */
   runtime_id: string;
+  /** False exactly when the agent has no runtime. Older backends omit it. */
+  runtime_bound?: boolean;
   name: string;
   description: string;
   instructions: string;
@@ -155,7 +394,7 @@ export interface Agent {
    * Coarse metadata signalling whether the agent has any custom env
    * vars configured, without exposing the keys or values. Reads of
    * the real map go through the dedicated `GET /api/agents/{id}/env`
-   * endpoint (owner/admin only, audited). MUL-2600.
+   * endpoint (agent owner or workspace owner/admin, audited). MUL-2600.
    *
    * Optional in the type so older backends (pre-MUL-2600) that omit
    * the field don't crash the renderer; downstream code should treat
@@ -191,14 +430,43 @@ export interface Agent {
    * Older backends omit this field; treat `undefined` as false.
    */
   mcp_config_redacted?: boolean;
+  /**
+   * The subset of Composio toolkit slugs this agent is allowed to mount as
+   * MCP servers at task dispatch — but only when the run originator is the
+   * agent owner (MUL-3869 / MUL-3721). `null`/`[]`/omitted all mean "no
+   * overlay regardless of who triggers". Owner-only data: the server hands
+   * it through verbatim to the owner and redacts it to `undefined` +
+   * `composio_toolkit_allowlist_redacted=true` for everyone else (same
+   * contract as `mcp_config`). Treat `undefined` as "unknown — assume none".
+   */
+  composio_toolkit_allowlist?: string[];
+  /**
+   * True when the server stripped `composio_toolkit_allowlist` from this
+   * response because the caller is not the agent owner. The MCP tab is
+   * creator-only so a redacted value should never reach the editor, but the
+   * UI renders a "hidden" fallback defensively. Older backends omit this
+   * field; treat `undefined` as false.
+   */
+  composio_toolkit_allowlist_redacted?: boolean;
   visibility: AgentVisibility;
+  /**
+   * Authoritative invocation permission mode (MUL-3963). The `visibility`
+   * field above is DERIVED from this on the backend. The current backend
+   * always returns this field.
+   */
+  permission_mode: AgentPermissionMode;
+  /**
+   * Invocation grants backing `permission_mode === "public_to"` (empty for a
+   * private agent). See `AgentInvocationTarget`.
+   */
+  invocation_targets: AgentInvocationTarget[];
   status: AgentStatus;
   max_concurrent_tasks: number;
   model: string;
   /**
    * Runtime-native reasoning/effort token (e.g. Claude's
    * `low|medium|high|xhigh|max`, Codex's
-   * `none|minimal|low|medium|high|xhigh`). Empty string means "no
+   * `none|minimal|low|medium|high|xhigh|max|ultra`). Empty string means "no
    * override": the backend omits the effort flag and the upstream CLI
    * config / built-in default decides at run time. The picker is
    * per-runtime per-model — the API never normalises across providers.
@@ -206,12 +474,38 @@ export interface Agent {
    * (MUL-2339).
    */
   thinking_level?: string;
+  /**
+   * Runtime-native Codex service tier (for example `priority`, displayed as
+   * Fast). Empty/undefined means no override: local Codex configuration and
+   * account defaults remain authoritative.
+   */
+  service_tier?: string;
   owner_id: string | null;
   skills: AgentSkillSummary[];
+  /** Runtime-local skills this agent must not inherit. Older servers omit it. */
+  disabled_runtime_skills?: DisabledRuntimeSkill[];
   created_at: string;
   updated_at: string;
   archived_at: string | null;
   archived_by: string | null;
+}
+
+export interface DisabledRuntimeSkill {
+  runtime_id: string;
+  provider: string;
+  root: "provider" | "universal" | "plugin";
+  key: string;
+  name?: string;
+  plugin?: string;
+}
+
+export interface SetAgentRuntimeSkillEnabledRequest {
+  runtime_id: string;
+  root: "provider" | "universal" | "plugin";
+  key: string;
+  name: string;
+  plugin?: string;
+  enabled: boolean;
 }
 
 /**
@@ -225,6 +519,8 @@ export interface AgentSkillSummary {
   id: string;
   name: string;
   description: string;
+	/** Older servers omit this field; consumers must treat that as enabled. */
+	enabled?: boolean;
 }
 
 export interface CreateAgentRequest {
@@ -237,13 +533,88 @@ export interface CreateAgentRequest {
   custom_env?: Record<string, string>;
   custom_args?: string[];
   visibility?: AgentVisibility;
+  /**
+   * Invocation permission mode (MUL-3963). When present it is authoritative;
+   * when absent the backend maps the legacy `visibility` field
+   * (private -> private, workspace -> public_to + workspace target). On
+   * UPDATE, permission changes are OWNER-ONLY (the backend silently ignores
+   * these fields from non-owner admins).
+   */
+  permission_mode?: AgentPermissionMode;
+  /** Invocation grants — see `AgentInvocationTargetInput`. */
+  invocation_targets?: AgentInvocationTargetInput[];
   max_concurrent_tasks?: number;
   model?: string;
   /** Optional runtime-native reasoning/effort token. See `Agent.thinking_level`. */
   thinking_level?: string;
+  /** Optional Codex service-tier catalog ID. See `Agent.service_tier`. */
+  service_tier?: string;
   /** Optional template slug used by the onboarding agent picker. Surfaced
    *  as the `template` property on the `agent_created` PostHog event. */
   template?: string;
+  /** Workspace skill IDs attached atomically with the agent row. */
+  skill_ids?: string[];
+}
+
+export interface AgentBuilderSession {
+  session_id: string;
+  builder_agent_id: string;
+  runtime_id: string;
+}
+
+/** Who may invoke the agent being created, as the creation form models it. */
+export type AgentPermissionScope = "private" | "workspace" | "members";
+
+/**
+ * The wire form of an in-progress agent configuration.
+ *
+ * Differs from the editable draft in two deliberate ways: `Set` becomes an
+ * array (JSON has no sets), and there is no runtime — which runtime a
+ * conversation executes on is owned by its carrier agent server-side, and a
+ * copy here could only go stale. `applied_message_id` travels along because it
+ * is what stops a restore from re-applying the last reply's `<agent_draft>`
+ * over edits the user made after it.
+ */
+export interface StoredAgentDraft {
+  name: string;
+  description: string;
+  instructions: string;
+  avatar_url: string | null;
+  model: string;
+  thinking_level: string;
+  service_tier: string;
+  skill_ids: string[];
+  permission_scope: AgentPermissionScope;
+  member_ids: string[];
+  team_ids: string[];
+  applied_message_id: string | null;
+}
+
+/** One unfinished agent-creation conversation, as listed by the studio. */
+export interface AgentBuilderSessionSummary {
+  session_id: string;
+  title: string;
+  /** The carrier's runtime — where this conversation actually executes. The
+   *  picker seeds from it so it can never disagree with what answers the next
+   *  message (MUL-5163). */
+  runtime_id: string;
+  created_at: string;
+  updated_at: string;
+  /** Still in the builder wire format; decode with the builder protocol helpers
+   *  before showing it to a human. */
+  last_message_content: string;
+  last_message_role: string;
+  last_message_at: string;
+  /** The stored configuration, or null when the conversation has never been
+   *  hand-edited — the client then replays the last `<agent_draft>` block. */
+  draft?: StoredAgentDraft | null;
+}
+
+/** Result of rebinding a live builder conversation to another runtime.
+ *  `runtime_id` is the runtime the server actually bound — the caller must
+ *  wait for it before showing the new runtime as selected. */
+export interface AgentBuilderRuntimeSwitch {
+  runtime_id: string;
 }
 
 /** Agent template summary — fields needed by the picker grid. Does NOT
@@ -287,6 +658,16 @@ export interface CreateAgentFromTemplateRequest {
   runtime_id: string;
   model?: string;
   visibility?: AgentVisibility;
+  /**
+   * Invocation permission mode (MUL-3963). When present it is authoritative;
+   * when absent the backend maps the legacy `visibility` field
+   * (private -> private, workspace -> public_to + workspace target). On
+   * UPDATE, permission changes are OWNER-ONLY (the backend silently ignores
+   * these fields from non-owner admins).
+   */
+  permission_mode?: AgentPermissionMode;
+  /** Invocation grants — see `AgentInvocationTargetInput`. */
+  invocation_targets?: AgentInvocationTargetInput[];
   max_concurrent_tasks?: number;
   /** Optional overrides applied to the template before creation. nil/omit
    *  uses the template's own value. */
@@ -326,8 +707,9 @@ export interface UpdateAgentRequest {
   /**
    * NOTE: `custom_env` is intentionally NOT updatable through this
    * request shape. Env edits flow through `client.updateAgentEnv` /
-   * `PUT /api/agents/{id}/env` — that path is owner/admin only,
-   * denies agent actors, and writes a persistent audit row. The
+   * `PUT /api/agents/{id}/env` — that path admits the agent owner or a
+   * workspace owner/admin, denies agent actors, and writes a
+   * persistent audit row. The
    * server REJECTS any `PUT /api/agents/{id}` body that includes
    * `custom_env` with a 400; do not put the field in this payload.
    * MUL-2600.
@@ -342,7 +724,29 @@ export interface UpdateAgentRequest {
    *     validate / translate it according to their own MCP integration
    */
   mcp_config?: unknown | null;
+  /**
+   * Composio toolkit allowlist. Tri-state semantics, mirroring the backend
+   * gate (MUL-3869):
+   *   - field omitted → no change
+   *   - `null` → clear the column (no MCP overlay for anyone)
+   *   - string[] → wholesale replace; the server lowercases / trims / dedupes
+   *     the slugs before persisting
+   * Writes are silently dropped server-side unless the caller is the agent
+   * owner, so the UI only ever exposes this field through the creator-only
+   * MCP tab.
+   */
+  composio_toolkit_allowlist?: string[] | null;
   visibility?: AgentVisibility;
+  /**
+   * Invocation permission mode (MUL-3963). When present it is authoritative;
+   * when absent the backend maps the legacy `visibility` field
+   * (private -> private, workspace -> public_to + workspace target). On
+   * UPDATE, permission changes are OWNER-ONLY (the backend silently ignores
+   * these fields from non-owner admins).
+   */
+  permission_mode?: AgentPermissionMode;
+  /** Invocation grants — see `AgentInvocationTargetInput`. */
+  invocation_targets?: AgentInvocationTargetInput[];
   status?: AgentStatus;
   max_concurrent_tasks?: number;
   model?: string;
@@ -355,6 +759,11 @@ export interface UpdateAgentRequest {
    *     runtime's provider enum, rejected with 400 if not recognised
    */
   thinking_level?: string;
+  /**
+   * Codex service-tier override. Omitted preserves the saved value, `""`
+   * clears it, and a non-empty value stores a runtime-catalog ID.
+   */
+  service_tier?: string;
 }
 
 /**
@@ -398,6 +807,8 @@ export interface SkillSummary {
   created_by: string | null;
   created_at: string;
   updated_at: string;
+	/** Present only when returned from an agent-scoped assignment endpoint. */
+	enabled?: boolean;
 }
 
 export interface Skill extends SkillSummary {
@@ -439,9 +850,27 @@ export interface IssueUsageSummary {
   total_output_tokens: number;
   total_cache_read_tokens: number;
   total_cache_write_tokens: number;
+  // Optional unlike the usage-row types: `getIssueUsage` returns this shape
+  // unvalidated (no zod schema), so nothing guarantees the field is present
+  // when the backend is older than the cost split.
+  cost_usd_ticks?: number;
+  uncosted_input_tokens?: number;
+  uncosted_output_tokens?: number;
+  uncosted_cache_read_tokens?: number;
+  uncosted_cache_write_tokens?: number;
   task_count: number;
 }
 
+// `cost_usd_ticks` + `uncosted_*`: the cost split every usage row carries.
+// All five are optional: a backend older than the split sends none of them,
+// and `undefined` has to stay distinguishable from a real 0 (see below).
+// The provider priced the rows behind `cost_usd_ticks` itself (1e-10 USD);
+// `uncosted_*` are the tokens it did not price, and are the only ones that
+// should go through the client's rate table. The `uncosted_*` fields are
+// optional because a backend older than the split omits them — `undefined`
+// there means "estimate from the full token counts", which is not the same as
+// a real 0 ("nothing left to estimate"). See estimateCost in
+// packages/views/runtimes/utils.ts.
 export interface RuntimeUsage {
   runtime_id: string;
   date: string;
@@ -451,6 +880,11 @@ export interface RuntimeUsage {
   output_tokens: number;
   cache_read_tokens: number;
   cache_write_tokens: number;
+  cost_usd_ticks?: number;
+  uncosted_input_tokens?: number;
+  uncosted_output_tokens?: number;
+  uncosted_cache_read_tokens?: number;
+  uncosted_cache_write_tokens?: number;
 }
 
 export interface RuntimeHourlyActivity {
@@ -458,17 +892,24 @@ export interface RuntimeHourlyActivity {
   count: number;
 }
 
-// One (agent, model) row of the "Cost by agent" tab on the runtime detail
-// page. Model stays on the wire because cost is computed client-side from
-// a per-model pricing table — the client groups these rows by agent_id and
-// sums cost per agent across models.
+// One (agent, provider, model) row of the "Cost by agent" tab on the runtime
+// detail page. provider + model stay on the wire because cost is computed
+// client-side from a per-model pricing table (provider disambiguates bare
+// model ids that collide across providers) — the client groups these rows by
+// agent_id and sums cost per agent across models.
 export interface RuntimeUsageByAgent {
   agent_id: string;
+  provider: string;
   model: string;
   input_tokens: number;
   output_tokens: number;
   cache_read_tokens: number;
   cache_write_tokens: number;
+  cost_usd_ticks?: number;
+  uncosted_input_tokens?: number;
+  uncosted_output_tokens?: number;
+  uncosted_cache_read_tokens?: number;
+  uncosted_cache_write_tokens?: number;
   task_count: number;
 }
 
@@ -482,20 +923,33 @@ export interface RuntimeUsageByHour {
   output_tokens: number;
   cache_read_tokens: number;
   cache_write_tokens: number;
+  cost_usd_ticks?: number;
+  uncosted_input_tokens?: number;
+  uncosted_output_tokens?: number;
+  uncosted_cache_read_tokens?: number;
+  uncosted_cache_write_tokens?: number;
   task_count: number;
 }
 
-// One (date, model) bucket of token usage for the workspace dashboard.
-// Same shape as RuntimeUsage but workspace-scoped (no runtime_id, no
-// provider field on the wire) and optionally narrowed to a single project
-// on the server side. Cost stays client-side via the model pricing table.
+// One (date, provider, model) bucket of token usage for the workspace
+// dashboard. Workspace-scoped (no runtime_id) and optionally narrowed to a
+// single project on the server side. `provider` is kept on the wire so the
+// client can disambiguate bare model ids that collide across providers
+// (e.g. Cursor's `auto` vs another provider's `auto`) when pricing. Cost
+// stays client-side via the model pricing table.
 export interface DashboardUsageDaily {
   date: string;
+  provider: string;
   model: string;
   input_tokens: number;
   output_tokens: number;
   cache_read_tokens: number;
   cache_write_tokens: number;
+  cost_usd_ticks?: number;
+  uncosted_input_tokens?: number;
+  uncosted_output_tokens?: number;
+  uncosted_cache_read_tokens?: number;
+  uncosted_cache_write_tokens?: number;
   task_count: number;
 }
 
@@ -504,11 +958,17 @@ export interface DashboardUsageDaily {
 // sums cost.
 export interface DashboardUsageByAgent {
   agent_id: string;
+  provider: string;
   model: string;
   input_tokens: number;
   output_tokens: number;
   cache_read_tokens: number;
   cache_write_tokens: number;
+  cost_usd_ticks?: number;
+  uncosted_input_tokens?: number;
+  uncosted_output_tokens?: number;
+  uncosted_cache_read_tokens?: number;
+  uncosted_cache_write_tokens?: number;
   task_count: number;
 }
 
@@ -532,6 +992,32 @@ export interface DashboardRunTimeDaily {
   total_seconds: number;
   task_count: number;
   failed_count: number;
+}
+
+// One (date, failure_reason) bucket of terminal-task counts for the workspace
+// dashboard's Errors metric.
+//
+// `failure_reason` carries the backend's canonical failure taxonomy (the 21
+// `taskfailure.Reason` values, plus `"unclassified"` for failed rows with an
+// empty column) — EXCEPT for the empty string, which is the *succeeded*
+// bucket. Shipping successes in the same series is deliberate: the error rate
+// then has a denominator built on exactly the same filters as its numerator.
+// `DashboardRunTimeDaily.task_count` is NOT a safe denominator here, because
+// it only counts tasks that actually started and a queue-expired task never
+// does.
+export interface DashboardFailureDaily {
+  date: string;
+  failure_reason: string;
+  task_count: number;
+}
+
+// Per-(agent, failure_reason) terminal-task counts. Same succeeded-bucket
+// convention as DashboardFailureDaily, so the client can rank agents by
+// failure rate rather than by raw failure count.
+export interface DashboardFailureByAgent {
+  agent_id: string;
+  failure_reason: string;
+  task_count: number;
 }
 
 export type RuntimeUpdateStatus =
@@ -564,6 +1050,17 @@ export interface RuntimeModel {
    * picker for this model". See MUL-2339.
    */
   thinking?: RuntimeModelThinking;
+  /** Runtime-native execution tiers advertised for this exact model. */
+  service_tiers?: RuntimeModelServiceTier[];
+}
+
+export interface RuntimeModelServiceTier {
+  /** Catalog ID sent to the provider protocol unchanged. */
+  id: string;
+  /** Provider-owned display name, for example `Fast`. */
+  name: string;
+  /** Optional provider-owned helper copy. */
+  description?: string;
 }
 
 export interface RuntimeModelThinking {
@@ -603,6 +1100,15 @@ export interface RuntimeModelListRequest {
   error?: string;
   created_at: string;
   updated_at: string;
+  /**
+   * True when the server answered from its own catalog cache instead of a live
+   * daemon round trip (MUL-5444). Informational only: such a response already
+   * arrives with `status: "completed"` and a populated `models`, so callers
+   * that ignore this field behave exactly as before. `cached_at` is the
+   * snapshot's capture time.
+   */
+  cached?: boolean;
+  cached_at?: string;
 }
 
 // Result shape returned by resolveRuntimeModels — includes the
@@ -611,6 +1117,15 @@ export interface RuntimeModelListRequest {
 export interface RuntimeModelsResult {
   models: RuntimeModel[];
   supported: boolean;
+  /**
+   * True when the server answered from its catalog cache rather than a live
+   * daemon round trip (MUL-5444). Drives the query's freshness policy: a
+   * cached answer is immediately revalidatable so the client never extends the
+   * server's staleness window.
+   */
+  cached?: boolean;
+  /** Capture time of the served snapshot, when the answer was cached. */
+  cachedAt?: string;
 }
 
 export type RuntimeLocalSkillStatus =
@@ -635,7 +1150,26 @@ export interface RuntimeLocalSkillSummary {
   description?: string;
   source_path: string;
   provider: string;
+  /**
+   * Which discovery root surfaced this skill: "provider" for the runtime's
+   * own skill directory (e.g. ~/.claude/skills) or "universal" for the
+   * cross-tool ~/.agents/skills fallback. Daemons that predate multi-root
+   * discovery omit the field; treat `undefined` as unknown rather than
+   * asserting either origin.
+   */
+  root?: "provider" | "universal" | "plugin";
+  /** Enabled runtime plugin that contributed this skill, when applicable. */
+  plugin?: string;
+  /** New daemons set this only when they can enforce per-agent disablement. */
+  can_disable?: boolean;
   file_count: number;
+}
+
+export interface RuntimeLocalMcpServerSummary {
+	name: string;
+	transport?: "stdio" | "http" | "sse" | "unknown";
+	source?: string;
+	enabled: boolean;
 }
 
 export interface RuntimeLocalSkillListRequest {
@@ -644,6 +1178,8 @@ export interface RuntimeLocalSkillListRequest {
   status: RuntimeLocalSkillStatus;
   skills?: RuntimeLocalSkillSummary[];
   supported: boolean;
+	mcp_servers?: RuntimeLocalMcpServerSummary[];
+	mcp_supported?: boolean;
   error?: string;
   created_at: string;
   updated_at: string;
@@ -678,6 +1214,8 @@ export interface RuntimeLocalSkillImportRequest {
 export interface RuntimeLocalSkillsResult {
   skills: RuntimeLocalSkillSummary[];
   supported: boolean;
+	mcpServers: RuntimeLocalMcpServerSummary[];
+	mcpSupported: boolean;
 }
 
 export interface RuntimeLocalSkillImportResult {

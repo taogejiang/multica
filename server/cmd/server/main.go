@@ -22,6 +22,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/scheduler"
 	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/featureflag"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -32,7 +33,11 @@ var (
 
 func newNamedRedisClient(base *redis.Options, suffix string) *redis.Client {
 	opts := *base
-	opts.ClientName = redisClientName(opts.ClientName, suffix)
+	if envBool("REDIS_DISABLE_CLIENT_NAME", false) {
+		opts.ClientName = ""
+	} else {
+		opts.ClientName = redisClientName(opts.ClientName, suffix)
+	}
 	return redis.NewClient(&opts)
 }
 
@@ -61,6 +66,7 @@ func shardedRelayConfigFromEnv() realtime.ShardedStreamRelayConfig {
 	cfg.StreamMaxLen = envPositiveInt64("REALTIME_RELAY_STREAM_MAXLEN", cfg.StreamMaxLen)
 	cfg.ReadCount = envPositiveInt64("REALTIME_RELAY_XREAD_COUNT", cfg.ReadCount)
 	cfg.ReadBlock = envDuration("REALTIME_RELAY_XREAD_BLOCK", cfg.ReadBlock)
+	cfg.ReplayGrace = envDuration("REALTIME_RELAY_REPLAY_GRACE", cfg.ReplayGrace)
 	return cfg
 }
 
@@ -118,6 +124,54 @@ func envDuration(name string, def time.Duration) time.Duration {
 	return v
 }
 
+func envNonNegativeDuration(name string, def time.Duration) time.Duration {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return def
+	}
+	v, err := time.ParseDuration(raw)
+	if err != nil || v < 0 {
+		slog.Warn("invalid env var, using default", "name", name, "value", raw, "default", def.String(), "error", err)
+		return def
+	}
+	return v
+}
+
+func holdBeforeShutdown(sig os.Signal, signals <-chan os.Signal, duration time.Duration) {
+	if duration <= 0 {
+		return
+	}
+	slog.Info("termination signal received; holding before shutdown",
+		"signal", sig.String(),
+		"duration", duration.String(),
+	)
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		slog.Info("shutdown hold complete", "duration", duration.String())
+	case interruptSig := <-signals:
+		slog.Info("shutdown hold interrupted by signal",
+			"signal", interruptSig.String(),
+			"configured_duration", duration.String(),
+		)
+	}
+}
+
+func envBool(name string, def bool) bool {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		slog.Warn("invalid env var, using default", "name", name, "value", raw, "default", def, "error", err)
+		return def
+	}
+	return v
+}
+
 func main() {
 	logger.Init()
 
@@ -140,6 +194,24 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
+	shutdownHoldDuration := envNonNegativeDuration("MULTICA_SHUTDOWN_HOLD_DURATION", 0)
+
+	// Feature flags: loaded once at startup from MULTICA_FEATURE_FLAGS_FILE
+	// (a YAML rule set) with FF_<KEY> env overrides layered on top.
+	// See docs/feature-flags.md for the schema and lifecycle rules.
+	//
+	// Booting the server without any flag config is intentional: when the
+	// env var is unset, every IsEnabled call falls through to the caller's
+	// default, so existing code paths are unchanged until someone adds a
+	// rule. A misconfigured (malformed / missing) file surfaces as a hard
+	// error so operators see misconfig the same way they do for any other
+	// MULTICA_*_FILE knob.
+	flags, err := featureflag.NewServiceFromEnv(featureflag.WithLogger(slog.Default()))
+	if err != nil {
+		slog.Error("feature flag configuration failed to load", "error", err)
+		os.Exit(1)
+	}
+	_ = flags // adopted by the router (opts.FeatureFlags) and server-side toggle points; see docs/feature-flags.md
 
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
@@ -201,6 +273,9 @@ func main() {
 		if err != nil {
 			slog.Error("invalid REDIS_URL — falling back to in-memory hub", "error", err)
 		} else {
+			if envBool("REDIS_DISABLE_CLIENT_NAME", false) {
+				slog.Info("redis: CLIENT SETNAME disabled (REDIS_DISABLE_CLIENT_NAME=true) for managed Redis compatibility")
+			}
 			storeRedis = newNamedRedisClient(opts, "store")
 			relayWriteRedis = newNamedRedisClient(opts, "realtime-write")
 
@@ -254,7 +329,7 @@ func main() {
 	// Order matters: subscriber listeners must register BEFORE notification listeners.
 	// The notification listener queries the subscriber table to determine recipients,
 	// so subscribers must be written first within the same synchronous event dispatch.
-	registerSubscriberListeners(bus, queries)
+	registerSubscriberListeners(bus, pool)
 	registerActivityListeners(bus, queries)
 	registerNotificationListeners(bus, queries)
 
@@ -263,6 +338,7 @@ func main() {
 	var httpMetrics *obsmetrics.HTTPMetrics
 	var businessMetrics *obsmetrics.BusinessMetrics
 	var samplerPool *pgxpool.Pool
+	var channelMediaMetrics *obsmetrics.ChannelMediaReconcilerMetrics
 	if metricsConfig.Enabled() {
 		// Build a dedicated tiny pool for the BusinessSamplerCollector
 		// so a stalled scrape can never starve business traffic. If the
@@ -290,6 +366,7 @@ func main() {
 		})
 		httpMetrics = metricsRegistry.HTTP
 		businessMetrics = metricsRegistry.Business
+		channelMediaMetrics = metricsRegistry.ChannelMedia
 		// Forward inbound daemon WS frames into the per-kind counter so
 		// dashboards can split heartbeat / unknown / invalid traffic.
 		if daemonHub != nil {
@@ -318,6 +395,7 @@ func main() {
 		BusinessMetrics:    businessMetrics,
 		DaemonHub:          daemonHub,
 		DaemonWakeup:       daemonWakeup,
+		FeatureFlags:       flags,
 		HeartbeatScheduler: heartbeatScheduler,
 	})
 
@@ -347,18 +425,32 @@ func main() {
 	// Start background sweeper to mark stale runtimes as offline.
 	go runRuntimeSweeper(sweepCtx, queries, liveness, taskSvc, bus)
 	go heartbeatScheduler.Run(sweepCtx)
-	go runAutopilotScheduler(autopilotCtx, queries, autopilotSvc)
 	go runAutopilotFailureMonitor(autopilotCtx, queries, bus, envFailureMonitorConfig())
 	go runDBStatsLogger(sweepCtx, pool)
+	if h.WebhookDeliveryWorker != nil {
+		go h.WebhookDeliveryWorker.Run(sweepCtx)
+	}
+	// GitHub PR-card API snapshot pipeline (MUL-5265): worker pool + TTL sweeper.
+	// No-op when unconfigured (no App private key).
+	h.PRRefresh.Start(sweepCtx)
 
-	// Lark inbound supervisor: holds the §4.4 WS lease per installation
-	// and runs the EventConnector for each. Nil when the Lark master
-	// key is unset — self-host deployments that have not opted in to
-	// Lark do not pay any goroutine cost. Lifecycle is bound to
-	// sweepCtx so the Hub winds down alongside the other long-running
-	// workers, AFTER the HTTP server has drained.
-	if h.LarkHub != nil {
-		go h.LarkHub.Run(sweepCtx)
+	// Channel inbound supervisor (MUL-3620): holds the §4.4 WS lease per
+	// installation and drives each channel.Channel. It is built
+	// unconditionally (it is channel-agnostic, not Lark-specific), so it
+	// always exists here; with no platform registered or no installation
+	// rows it simply idles. Lifecycle is bound to sweepCtx so it winds down
+	// alongside the other long-running workers, AFTER the HTTP server has
+	// drained.
+	if h.ChannelSupervisor != nil {
+		go h.ChannelSupervisor.Run(sweepCtx)
+	}
+
+	// Media intent-ledger reconciler (PR #5580): settles uploaded-but-unbound
+	// channel media objects. An independent worker so object-storage latency
+	// spikes cannot starve any other sweeper's cadence.
+	if h.ChannelMediaReconciler != nil {
+		h.ChannelMediaReconciler.Metrics = channelMediaMetrics
+		go h.ChannelMediaReconciler.Run(sweepCtx)
 	}
 
 	// MUL-2957: DB-backed execution scheduler. The scheduler turns the
@@ -378,11 +470,19 @@ func main() {
 	schedulerMgr := scheduler.NewManager(pool, scheduler.Options{})
 	if err := schedulerMgr.Register(scheduler.TaskUsageHourlyJob(pool)); err != nil {
 		slog.Warn("scheduler: failed to register task_usage_hourly rollup job", "error", err)
-	} else {
-		go func() {
-			_ = schedulerMgr.Run(sweepCtx)
-		}()
 	}
+	// MUL-3551: scheduled-Autopilot dispatch runs on the same DB-backed
+	// scheduler. The job owns its plan_times via PlansForScope (each
+	// trigger has its own cron expression, so the Cadence planner does
+	// not fit). Crash recovery, occurrence-level idempotency, lease
+	// theft, and retry are all reused from the manager + sys_cron_executions
+	// — there is no separate goroutine for scheduled Autopilot anymore.
+	if err := schedulerMgr.Register(scheduler.AutopilotScheduleDispatchJob(pool, queries, autopilotSvc)); err != nil {
+		slog.Warn("scheduler: failed to register autopilot_schedule_dispatch job", "error", err)
+	}
+	go func() {
+		_ = schedulerMgr.Run(sweepCtx)
+	}()
 
 	if metricsServer != nil {
 		go func() {
@@ -403,7 +503,11 @@ func main() {
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
+	sig := <-quit
+	holdBeforeShutdown(sig, quit, shutdownHoldDuration)
+	// Restore the default behavior so another signal during graceful shutdown
+	// can still terminate the process instead of being left unread in quit.
+	signal.Stop(quit)
 
 	slog.Info("shutting down server")
 	autopilotCancel()
@@ -424,20 +528,34 @@ func main() {
 	// final batch of queued heartbeat bumps.
 	sweepCancel()
 	heartbeatScheduler.Stop()
+	if h.WebhookDeliveryWorker != nil && !h.WebhookDeliveryWorker.WaitWithTimeout(5*time.Second) {
+		slog.Warn("webhook delivery worker did not exit within shutdown timeout")
+	}
 
-	// Join the Lark Hub's per-installation supervisor goroutines so the
+	// Join the channel supervisor's per-installation goroutines so the
 	// lease renewer can issue a final release before process exit;
 	// otherwise the next replica would have to wait the full LeaseTTL
 	// before picking up the installation on the other side of the
 	// redeploy. The wait is bounded — if a supervisor is wedged (DB
-	// pool stalled, a future real EventConnector ignoring ctx, etc.)
-	// the fallback is the natural LeaseTTL expiry on the other side,
-	// which is strictly better than holding shutdown open forever.
-	if h.LarkHub != nil {
-		if !h.LarkHub.WaitWithTimeout(h.LarkHub.ShutdownTimeout()) {
-			slog.Warn("lark hub: supervisors did not exit within shutdown timeout; proceeding",
-				"timeout", h.LarkHub.ShutdownTimeout().String(),
+	// pool stalled, a connector ignoring ctx, etc.) the fallback is the
+	// natural LeaseTTL expiry on the other side, which is strictly better
+	// than holding shutdown open forever. Then drain the Feishu runtime:
+	// the supervisors have stopped delivering inbound events, so flush the
+	// debounced run triggers and join any in-flight outbound replies
+	// (each bounded by ReplyTimeout) so a binding card / offline notice is
+	// not lost on shutdown.
+	if h.ChannelSupervisor != nil {
+		if !h.ChannelSupervisor.WaitWithTimeout(h.ChannelSupervisor.ShutdownTimeout()) {
+			slog.Warn("channel supervisor: connections did not exit within shutdown timeout; proceeding",
+				"timeout", h.ChannelSupervisor.ShutdownTimeout().String(),
 			)
+		}
+		if h.ChannelRouter != nil {
+			drainCtx, drainCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if !h.ChannelRouter.Drain(drainCtx) {
+				slog.Warn("channel router: drain deadline reached; deferred media fallback remains durable")
+			}
+			drainCancel()
 		}
 	}
 

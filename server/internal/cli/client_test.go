@@ -166,6 +166,51 @@ func TestPostJSON(t *testing.T) {
 	})
 }
 
+func TestDeleteJSONResponse(t *testing.T) {
+	type respBody struct {
+		ID string `json:"id"`
+	}
+
+	t.Run("success decodes response", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodDelete {
+				t.Errorf("expected DELETE, got %s", r.Method)
+			}
+			if auth := r.Header.Get("Authorization"); auth != "Bearer test-token" {
+				t.Errorf("expected Authorization Bearer test-token, got %s", auth)
+			}
+			json.NewEncoder(w).Encode(respBody{ID: "comment-123"})
+		}))
+		defer srv.Close()
+
+		client := NewAPIClient(srv.URL, "", "test-token")
+		var out respBody
+		if err := client.DeleteJSONResponse(context.Background(), "/test", &out); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if out.ID != "comment-123" {
+			t.Errorf("expected ID comment-123, got %s", out.ID)
+		}
+	})
+
+	t.Run("error status", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, "missing")
+		}))
+		defer srv.Close()
+
+		client := NewAPIClient(srv.URL, "", "test-token")
+		err := client.DeleteJSONResponse(context.Background(), "/test", nil)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if got := err.Error(); got != "DELETE /test returned 404: missing" {
+			t.Errorf("unexpected error message: %s", got)
+		}
+	})
+}
+
 func TestDownloadFile(t *testing.T) {
 	t.Run("relative URL is resolved against BaseURL and sent with auth", func(t *testing.T) {
 		var gotPath, gotAuth string
@@ -381,4 +426,102 @@ func TestNormalizeGOOS(t *testing.T) {
 			t.Errorf("normalizeGOOS(%q) = %q, want %q", in, got, want)
 		}
 	}
+}
+
+// TestSetHeaders_AdvertisesStableAttachmentURLs is the only test that proves
+// Phase 1 of MUL-5372 is actually switched on.
+//
+// The server-side tests verify that a request carrying
+// `X-Client-Capabilities: stable_attachment_urls` gets stable attachment paths,
+// but nothing there observes what the CLI sends. Without this assertion a typo
+// in the token, or dropping the header from setHeaders entirely, would leave
+// every other test green while the CLI silently went back to receiving ~800-char
+// signed URLs on every attachment of every list read.
+//
+// The exact string is load-bearing: the server matches the token literally
+// (handler.requestHasClientCapability), so it is asserted verbatim rather than
+// through the constant.
+func TestSetHeaders_AdvertisesStableAttachmentURLs(t *testing.T) {
+	const wantCapability = "stable_attachment_urls"
+
+	// Every verb goes through setHeaders, and an agent's read path is not only
+	// GET (comment add posts, attachment upload multiparts). Cover the shapes
+	// that actually carry attachment payloads back.
+	t.Run("GET", func(t *testing.T) {
+		var got string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			got = r.Header.Get("X-Client-Capabilities")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		}))
+		defer srv.Close()
+
+		client := NewAPIClient(srv.URL, "ws-1", "test-token")
+		var out map[string]any
+		if err := client.GetJSON(context.Background(), "/api/issues/x/comments", &out); err != nil {
+			t.Fatalf("GetJSON: %v", err)
+		}
+		if got != wantCapability {
+			t.Errorf("X-Client-Capabilities = %q, want %q — Phase 1 is off unless the CLI advertises this", got, wantCapability)
+		}
+	})
+
+	t.Run("GET with headers", func(t *testing.T) {
+		var got string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			got = r.Header.Get("X-Client-Capabilities")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`[]`))
+		}))
+		defer srv.Close()
+
+		client := NewAPIClient(srv.URL, "ws-1", "test-token")
+		var out []map[string]any
+		if _, err := client.GetJSONWithHeaders(context.Background(), "/api/issues/x/comments", &out); err != nil {
+			t.Fatalf("GetJSONWithHeaders: %v", err)
+		}
+		if got != wantCapability {
+			t.Errorf("X-Client-Capabilities = %q, want %q", got, wantCapability)
+		}
+	})
+
+	t.Run("POST", func(t *testing.T) {
+		var got string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			got = r.Header.Get("X-Client-Capabilities")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		}))
+		defer srv.Close()
+
+		client := NewAPIClient(srv.URL, "ws-1", "test-token")
+		var out map[string]any
+		if err := client.PostJSON(context.Background(), "/api/issues/x/comments", map[string]string{"content": "hi"}, &out); err != nil {
+			t.Fatalf("PostJSON: %v", err)
+		}
+		if got != wantCapability {
+			t.Errorf("X-Client-Capabilities = %q, want %q", got, wantCapability)
+		}
+	})
+
+	// An unauthenticated client (no token configured yet) must still advertise:
+	// the capability describes what the binary can parse, not who it is.
+	t.Run("without a token", func(t *testing.T) {
+		var got string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			got = r.Header.Get("X-Client-Capabilities")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		}))
+		defer srv.Close()
+
+		client := NewAPIClient(srv.URL, "", "")
+		var out map[string]any
+		if err := client.GetJSON(context.Background(), "/api/health", &out); err != nil {
+			t.Fatalf("GetJSON: %v", err)
+		}
+		if got != wantCapability {
+			t.Errorf("X-Client-Capabilities = %q, want %q", got, wantCapability)
+		}
+	})
 }

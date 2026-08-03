@@ -1,4 +1,5 @@
 import type { Metadata, Viewport } from "next";
+import Script from "next/script";
 import { Inter, Geist_Mono, Source_Serif_4 } from "next/font/google";
 import { ThemeProvider } from "@/components/theme-provider";
 import { Toaster } from "@multica/ui/components/ui/sonner";
@@ -7,6 +8,10 @@ import { WebProviders } from "@/components/web-providers";
 import type { SupportedLocale } from "@multica/core/i18n";
 import { RESOURCES } from "@multica/views/locales";
 import { getRequestLocale } from "@/lib/request-locale";
+import {
+  resolveBrowserApiBaseUrl,
+  resolveBrowserWsUrl,
+} from "@/config/runtime-urls";
 import "./globals.css";
 
 // Inter is the Latin UI face. next/font produces a hashed family (`__Inter_xxx`)
@@ -19,8 +24,15 @@ import "./globals.css";
 // stack), and a hashed family name can only be referenced from CSS via a variable.
 // Keeping the CJK chain in CSS also keeps it CSP-safe and in sync with the desktop
 // app, which defines the same chain in apps/desktop/src/renderer/src/globals.css.
+//
+// Italic is loaded explicitly: `style` defaults to `["normal"]`, and without a real
+// italic face the ~20 semantic italic labels (chat empty states, model-picker's
+// "Managed by runtime", dashboard/squad placeholders) plus every markdown <em> and
+// blockquote rendered as browser-synthesized oblique. Keep in sync with desktop's
+// `@fontsource-variable/inter/wght-italic.css` import.
 const inter = Inter({
   subsets: ["latin"],
+  style: ["normal", "italic"],
   variable: "--font-inter",
 });
 // Mono font has no explicit CJK fallback: CJK chars in code blocks are inherently
@@ -108,6 +120,8 @@ export default async function RootLayout({
 }) {
   const locale = await getRequestLocale();
   const resources = { [locale]: RESOURCES[locale] };
+  const apiBaseUrl = resolveBrowserApiBaseUrl(process.env);
+  const wsUrl = resolveBrowserWsUrl(process.env);
 
   return (
     <html
@@ -116,8 +130,31 @@ export default async function RootLayout({
       className={cn("antialiased font-sans h-full", inter.variable, geistMono.variable, sourceSerif.variable)}
     >
       <body className="h-full overflow-hidden">
+        {/*
+          react-grab: dev-only element inspector. Hold ⌘C (Mac) / Ctrl+C and click
+          any element to copy its source path + line + component stack for pasting
+          to an AI. Opt-in per developer: only loads when VITE_REACT_GRAB is set in
+          a local, gitignored apps/web/.env.local — it never activates for anyone
+          else. Both guards are read server-side, so the <Script> is omitted from
+          the HTML entirely unless you opted in. The VITE_ prefix is shared with the
+          desktop renderer (apps/desktop/src/renderer/src/main.tsx), where Vite only
+          exposes VITE_-prefixed vars to client code, so one var name covers both
+          apps. See https://www.react-grab.com/
+        */}
+        {process.env.NODE_ENV === "development" && process.env.VITE_REACT_GRAB && (
+          <Script
+            src="//unpkg.com/react-grab/dist/index.global.js"
+            crossOrigin="anonymous"
+            strategy="beforeInteractive"
+          />
+        )}
         <ThemeProvider>
-          <WebProviders locale={locale} resources={resources}>
+          <WebProviders
+            locale={locale}
+            resources={resources}
+            apiBaseUrl={apiBaseUrl}
+            wsUrl={wsUrl}
+          >
             {children}
           </WebProviders>
           <Toaster />

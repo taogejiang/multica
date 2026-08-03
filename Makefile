@@ -13,6 +13,9 @@ POSTGRES_USER ?= multica
 POSTGRES_PASSWORD ?= multica
 POSTGRES_PORT ?= 5432
 PORT := $(or $(BACKEND_PORT),$(API_PORT),$(SERVER_PORT),$(PORT),8080)
+ifeq ($(origin MULTICA_PUBLIC_URL), undefined)
+MULTICA_PUBLIC_URL := http://localhost:$(PORT)
+endif
 FRONTEND_PORT ?= 3000
 FRONTEND_ORIGIN ?= http://localhost:$(FRONTEND_PORT)
 MULTICA_APP_URL ?= $(FRONTEND_ORIGIN)
@@ -37,6 +40,29 @@ define REQUIRE_ENV
 	fi
 endef
 
+# Self-hosting requires the Docker Compose CLI plugin (`docker compose`).
+# The self-host compose files use compose-spec syntax (top-level `name:`, no
+# `version:`) that the legacy v1 `docker-compose` standalone cannot parse, so we
+# fail early with an actionable message instead of a cryptic CLI parse error
+# (e.g. "unknown shorthand flag: 'f' in -f") when the plugin is missing or v1.
+# Keep the message short and OS-agnostic: per-OS install steps belong in docs.
+define REQUIRE_COMPOSE
+	@if ! compose_version=$$($(COMPOSE) version --short 2>/dev/null); then \
+		echo "Docker Compose ('docker compose') was not found."; \
+		echo "Self-hosting requires the Compose CLI plugin; legacy 'docker-compose' v1 is not supported."; \
+		echo "Install Docker Compose from https://docs.docker.com/compose/install/ and verify with: docker compose version"; \
+		exit 1; \
+	fi; \
+	case "$$compose_version" in \
+		1.*|v1.*) \
+			echo "'$(COMPOSE)' is legacy Docker Compose v1 ($$compose_version)."; \
+			echo "Self-hosting requires the Compose CLI plugin; legacy 'docker-compose' v1 is not supported."; \
+			echo "Install Docker Compose from https://docs.docker.com/compose/install/ and verify with: docker compose version"; \
+			exit 1; \
+			;; \
+	esac
+endef
+
 # Default target changed from selfhost to help: bare `make` now prints this help
 # instead of launching a full Docker Compose build, which is safer for onboarding.
 .DEFAULT_GOAL := help
@@ -54,24 +80,28 @@ makehelp: help ## Alias for `make help`
 ##@ Self-hosting
 
 selfhost: ## Create .env if needed, then pull and start the official self-hosted images
+	$(REQUIRE_COMPOSE)
 	@if [ ! -f .env ]; then \
 		echo "==> Creating .env from .env.example..."; \
 		cp .env.example .env; \
 		JWT=$$(openssl rand -hex 32); \
 		PGPASS=$$(openssl rand -hex 24); \
+		VCSKEY=$$(openssl rand -base64 32); \
 		if [ "$$(uname)" = "Darwin" ]; then \
 			sed -i '' "s/^JWT_SECRET=.*/JWT_SECRET=$$JWT/" .env; \
 			sed -i '' "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$$PGPASS/" .env; \
 			sed -i '' -E "s#^(DATABASE_URL=postgres://[^:]+:)[^@]*(@.*)#\1$$PGPASS\2#" .env; \
+			sed -i '' "s#^MULTICA_VCS_SECRET_KEY=.*#MULTICA_VCS_SECRET_KEY=$$VCSKEY#" .env; \
 		else \
 			sed -i "s/^JWT_SECRET=.*/JWT_SECRET=$$JWT/" .env; \
 			sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$$PGPASS/" .env; \
 			sed -i -E "s#^(DATABASE_URL=postgres://[^:]+:)[^@]*(@.*)#\1$$PGPASS\2#" .env; \
+			sed -i "s#^MULTICA_VCS_SECRET_KEY=.*#MULTICA_VCS_SECRET_KEY=$$VCSKEY#" .env; \
 		fi; \
-		echo "==> Generated random JWT_SECRET and POSTGRES_PASSWORD"; \
+		echo "==> Generated random JWT_SECRET, POSTGRES_PASSWORD, and MULTICA_VCS_SECRET_KEY"; \
 	fi
 	@echo "==> Pulling official Multica images..."
-	@if ! docker compose -f docker-compose.selfhost.yml pull; then \
+	@if ! $(COMPOSE) -f docker-compose.selfhost.yml pull; then \
 		echo ""; \
 		echo "Official images for tag '$${MULTICA_IMAGE_TAG:-latest}' are not published yet."; \
 		echo "If this is before the first GHCR release, build from the current checkout:"; \
@@ -79,85 +109,38 @@ selfhost: ## Create .env if needed, then pull and start the official self-hosted
 		exit 1; \
 	fi
 	@echo "==> Starting Multica via Docker Compose..."
-	docker compose -f docker-compose.selfhost.yml up -d
-	@echo "==> Waiting for backend to be ready..."
-	@for i in $$(seq 1 30); do \
-		if curl -sf http://localhost:$${PORT:-8080}/health > /dev/null 2>&1; then \
-			break; \
-		fi; \
-		sleep 2; \
-	done
-	@if curl -sf http://localhost:$${PORT:-8080}/health > /dev/null 2>&1; then \
-		echo ""; \
-		echo "✓ Multica is running!"; \
-		echo "  Frontend: http://localhost:$${FRONTEND_PORT:-3000}"; \
-		echo "  Backend:  http://localhost:$${PORT:-8080}"; \
-		echo ""; \
-		echo "Images: $${MULTICA_BACKEND_IMAGE:-ghcr.io/multica-ai/multica-backend}:$${MULTICA_IMAGE_TAG:-latest}"; \
-		echo "        $${MULTICA_WEB_IMAGE:-ghcr.io/multica-ai/multica-web}:$${MULTICA_IMAGE_TAG:-latest}"; \
-		echo ""; \
-		echo "Log in: configure RESEND_API_KEY in .env for email codes,"; \
-		echo "        or read the generated code from backend logs when Resend is unset."; \
-		echo ""; \
-		echo "Next — install the CLI and connect your machine:"; \
-		echo "  brew install multica-ai/tap/multica"; \
-		echo "  multica setup self-host"; \
-	else \
-		echo ""; \
-		echo "Services are still starting. Check logs:"; \
-		echo "  docker compose -f docker-compose.selfhost.yml logs"; \
-	fi
+	$(COMPOSE) -f docker-compose.selfhost.yml up -d
+	@bash scripts/selfhost-wait.sh official
 
 selfhost-build: ## Build backend/web from the current checkout and start the self-hosted stack
+	$(REQUIRE_COMPOSE)
 	@if [ ! -f .env ]; then \
 		echo "==> Creating .env from .env.example..."; \
 		cp .env.example .env; \
 		JWT=$$(openssl rand -hex 32); \
 		PGPASS=$$(openssl rand -hex 24); \
+		VCSKEY=$$(openssl rand -base64 32); \
 		if [ "$$(uname)" = "Darwin" ]; then \
 			sed -i '' "s/^JWT_SECRET=.*/JWT_SECRET=$$JWT/" .env; \
 			sed -i '' "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$$PGPASS/" .env; \
 			sed -i '' -E "s#^(DATABASE_URL=postgres://[^:]+:)[^@]*(@.*)#\1$$PGPASS\2#" .env; \
+			sed -i '' "s#^MULTICA_VCS_SECRET_KEY=.*#MULTICA_VCS_SECRET_KEY=$$VCSKEY#" .env; \
 		else \
 			sed -i "s/^JWT_SECRET=.*/JWT_SECRET=$$JWT/" .env; \
 			sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$$PGPASS/" .env; \
 			sed -i -E "s#^(DATABASE_URL=postgres://[^:]+:)[^@]*(@.*)#\1$$PGPASS\2#" .env; \
+			sed -i "s#^MULTICA_VCS_SECRET_KEY=.*#MULTICA_VCS_SECRET_KEY=$$VCSKEY#" .env; \
 		fi; \
-		echo "==> Generated random JWT_SECRET and POSTGRES_PASSWORD"; \
+		echo "==> Generated random JWT_SECRET, POSTGRES_PASSWORD, and MULTICA_VCS_SECRET_KEY"; \
 	fi
 	@echo "==> Building Multica from the current checkout..."
-	docker compose -f docker-compose.selfhost.yml -f docker-compose.selfhost.build.yml up -d --build
-	@echo "==> Waiting for backend to be ready..."
-	@for i in $$(seq 1 30); do \
-		if curl -sf http://localhost:$${PORT:-8080}/health > /dev/null 2>&1; then \
-			break; \
-		fi; \
-		sleep 2; \
-	done
-	@if curl -sf http://localhost:$${PORT:-8080}/health > /dev/null 2>&1; then \
-		echo ""; \
-		echo "✓ Multica is running!"; \
-		echo "  Frontend: http://localhost:$${FRONTEND_PORT:-3000}"; \
-		echo "  Backend:  http://localhost:$${PORT:-8080}"; \
-		echo ""; \
-		echo "Log in: configure RESEND_API_KEY in .env for email codes,"; \
-		echo "        or read the generated code from backend logs when Resend is unset."; \
-		echo ""; \
-		echo "Built images locally via docker-compose.selfhost.build.yml."; \
-		echo "Local tags: multica-backend:dev and multica-web:dev."; \
-		echo ""; \
-		echo "Next — install the CLI and connect your machine:"; \
-		echo "  brew install multica-ai/tap/multica"; \
-		echo "  multica setup self-host"; \
-	else \
-		echo ""; \
-		echo "Services are still starting. Check logs:"; \
-		echo "  docker compose -f docker-compose.selfhost.yml logs"; \
-	fi
+	$(COMPOSE) -f docker-compose.selfhost.yml -f docker-compose.selfhost.build.yml up -d --build
+	@bash scripts/selfhost-wait.sh build
 
 selfhost-stop: ## Stop the self-hosted Docker Compose stack
+	$(REQUIRE_COMPOSE)
 	@echo "==> Stopping Multica services..."
-	docker compose -f docker-compose.selfhost.yml down
+	$(COMPOSE) -f docker-compose.selfhost.yml down
 	@echo "✓ All services stopped."
 
 # ---------- One-click commands ----------
@@ -281,9 +264,9 @@ cli: ## Run the multica CLI with ARGS or MULTICA_ARGS from source
 	@$(MAKE) multica MULTICA_ARGS="$(MULTICA_ARGS)"
 
 multica: ## Run the multica CLI entrypoint directly from the Go source tree
-	cd server && go run ./cmd/multica $(MULTICA_ARGS)
+	cd server && go run -ldflags "-X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.date=$(DATE)" ./cmd/multica $(MULTICA_ARGS)
 
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+VERSION ?= $(shell git describe --tags --match 'v[0-9]*' --always --dirty 2>/dev/null || echo dev)
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 DATE    ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 
@@ -296,7 +279,7 @@ test: ## Run Go tests after ensuring the target DB exists and migrations are app
 	$(REQUIRE_ENV)
 	@bash scripts/ensure-postgres.sh "$(ENV_FILE)"
 	cd server && go run ./cmd/migrate up
-	cd server && go test ./...
+	bash scripts/test-go.sh --race
 
 # Database
 ##@ Database
@@ -317,5 +300,10 @@ sqlc: ## Regenerate sqlc code
 # Cleanup
 ##@ Cleanup
 
-clean: ## Remove generated server binaries and temp files
+clean: ## Remove build caches, generated binaries, and temp files
 	rm -rf server/bin server/tmp
+	rm -rf apps/*/.next apps/*/.source apps/*/.expo
+	rm -rf apps/*/out apps/*/dist apps/*/dist-electron packages/*/dist
+	rm -rf .turbo apps/*/.turbo packages/*/.turbo
+	rm -rf apps/*/*.tsbuildinfo packages/*/*.tsbuildinfo
+	@echo "✓ Clean complete."

@@ -1,0 +1,79 @@
+---
+title: Chat integrations
+description: Connect Multica agents to Feishu, Lark, or Slack and use them from the chat tools your team already uses.
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+Chat integrations let the team ask an agent questions, @-mention it in a group chat, or create issues from the chat window — without opening Multica.
+
+Feishu/Lark and Slack are supported today. Both integrations share the same session, identity, and execution mechanics but install differently.
+
+## Choose a platform
+
+| | Feishu / Lark | Slack |
+|---|---|---|
+| Installation | Generate a QR code in Multica and authorize by scanning it with Feishu | Create an app in Slack, then paste two tokens into Multica |
+| DM the agent | Supported | Supported |
+| Groups or channels | Triggered by @-mentioning the Bot | Triggered by @-mentioning the Bot |
+| Create issues | `/issue` message command; creates the issue from your input as-is | `/issue` slash command; the agent writes up the description before creating |
+| Connection | Platform long connection | Socket Mode |
+
+New connections are currently open only for mainland-China Feishu; existing international Lark connections keep working and can still be managed.
+
+Each Bot is bound to one Multica agent. To use several agents on the same chat platform, connect a separate Bot for each.
+
+Step-by-step guides:
+
+- [Feishu / Lark Bot integration](/lark-bot-integration)
+- [Slack Bot integration](/slack-bot-integration)
+
+## How a message is processed
+
+1. Multica resolves the Bot to its workspace and agent.
+2. In a group or channel, only messages that explicitly @-mention the Bot continue; DMs need no mention.
+3. Multica verifies the sender's account binding and workspace membership.
+4. The message joins an [agent chat](/chat) session, and a task is created.
+5. The agent's reply goes back to the original DM or thread.
+
+Channel messages that don't @-mention the Bot never trigger the agent and are not added to its conversation context.
+
+## Session isolation
+
+- Feishu/Lark separates sessions by chat; later messages in the same chat continue the same session.
+- Slack separates DMs by channel; in a channel, each thread holds its own session.
+
+Follow-ups in a channel still need a fresh @-mention. The agent only receives messages addressed to it — it never reads the whole channel history automatically.
+
+## Account binding
+
+The first time a member messages the Bot, they receive an account binding link. After signing in to Multica, the platform account is linked to their membership in the current workspace.
+
+Multica only runs the agent after binding completes. Every message re-checks account binding and workspace membership; after leaving a workspace, the Bot can no longer be used to reach it.
+
+<Callout type="info">
+Account binding only confirms who the sender is. Other members on the chat platform are not automatically added to the Multica workspace.
+</Callout>
+
+## Manage connections
+
+Workspace owners and admins can connect or disconnect Bots; for Feishu/Lark Bots, connecting and disconnecting is also open to the agent's owner. Regular members can view connected integrations and use the agents they have access to.
+
+After disconnecting, the Bot stops receiving new messages. Existing Multica conversations and run records are kept.
+
+## Self-hosting
+
+A self-hosted deployment must configure a 32-byte encryption key for each platform before Multica opens its connection entry point:
+
+```dotenv
+MULTICA_LARK_SECRET_KEY=<base64-encoded 32-byte key>
+MULTICA_SLACK_SECRET_KEY=<base64-encoded 32-byte key>
+```
+
+These keys encrypt stored Bot credentials. See [Environment variables](/environment-variables) for how to generate, store, and rotate them. Multica Cloud already has this configured.
+
+## Next steps
+
+- [Feishu / Lark Bot integration](/lark-bot-integration) — connect an agent by scanning a QR code.
+- [Slack Bot integration](/slack-bot-integration) — create a Slack app and paste its tokens into Multica.
+- [Chat](/chat) — the conversation and execution model behind every Bot.

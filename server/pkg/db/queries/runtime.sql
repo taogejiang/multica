@@ -7,6 +7,15 @@ ORDER BY created_at ASC;
 SELECT * FROM agent_runtime
 WHERE id = $1;
 
+-- name: GetAgentRuntimes :many
+-- Batch variant of GetAgentRuntime (MUL-4257): loads every runtime in the
+-- input set in one round trip so the machine-level batch claim handler can
+-- resolve+authorize all of a daemon's runtimes without one point query per
+-- runtime. Rows are returned only for ids that exist; the caller matches them
+-- back by id and skips any that are missing.
+SELECT * FROM agent_runtime
+WHERE id = ANY(@ids::uuid[]);
+
 -- name: LockAgentRuntime :one
 -- Acquires a row-level exclusive lock on the runtime row. Used at the
 -- top of the cascade-delete transaction so that:
@@ -17,10 +26,9 @@ WHERE id = $1;
 --      our transaction finishes; and
 --   2. concurrent UPDATE/DELETE of the runtime row itself (e.g. another
 --      delete attempt) waits for us to commit.
--- Combined with ListActiveAgentsByRuntimeForUpdate (which row-locks the
--- existing active set) this closes the plan-compare → archive race that
--- was possible at read-committed isolation between the snapshot and the
--- bulk archive.
+-- Combined with ListUserAgentsByRuntimeForUpdate (which row-locks active and
+-- archived user agents) this closes both plan drift and archived-agent restore
+-- races under read-committed isolation.
 SELECT * FROM agent_runtime
 WHERE id = $1
 FOR UPDATE;
@@ -45,10 +53,48 @@ INSERT INTO agent_runtime (
     owner_id,
     last_seen_at
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
-ON CONFLICT (workspace_id, daemon_id, provider)
+-- Built-in runtimes carry no profile_id. The arbiter is the partial unique
+-- index from migration 121 (WHERE profile_id IS NULL); the predicate must be
+-- spelled out so Postgres selects that partial index, not the custom-runtime
+-- one on (workspace_id, daemon_id, profile_id).
+ON CONFLICT (workspace_id, daemon_id, provider) WHERE profile_id IS NULL
 DO UPDATE SET
     name = EXCLUDED.name,
     runtime_mode = EXCLUDED.runtime_mode,
+    status = EXCLUDED.status,
+    device_info = EXCLUDED.device_info,
+    metadata = EXCLUDED.metadata,
+    owner_id = COALESCE(EXCLUDED.owner_id, agent_runtime.owner_id),
+    last_seen_at = now(),
+    updated_at = now()
+RETURNING *, (xmax = 0) AS inserted;
+
+-- name: UpsertAgentRuntimeWithProfile :one
+-- Custom-runtime registration: a daemon resolved a workspace runtime_profile's
+-- command_name on PATH and is registering an instance of it. The arbiter is the
+-- partial unique index from migration 120 (WHERE profile_id IS NOT NULL), so a
+-- single daemon can host the built-in provider AND any number of custom
+-- profiles of the same protocol family. provider stays the protocol family so
+-- task routing (agent.New(provider)) is unchanged; profile_id is the stable
+-- identity. (xmax = 0) AS inserted mirrors UpsertAgentRuntime.
+INSERT INTO agent_runtime (
+    workspace_id,
+    daemon_id,
+    name,
+    runtime_mode,
+    provider,
+    status,
+    device_info,
+    metadata,
+    owner_id,
+    profile_id,
+    last_seen_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+ON CONFLICT (workspace_id, daemon_id, profile_id) WHERE profile_id IS NOT NULL
+DO UPDATE SET
+    name = EXCLUDED.name,
+    runtime_mode = EXCLUDED.runtime_mode,
+    provider = EXCLUDED.provider,
     status = EXCLUDED.status,
     device_info = EXCLUDED.device_info,
     metadata = EXCLUDED.metadata,
@@ -66,6 +112,44 @@ UPDATE agent_runtime
 SET visibility = @visibility, updated_at = now()
 WHERE id = @id
 RETURNING *;
+
+-- name: UpdateAgentRuntimeCustomName :one
+-- Sets or clears a runtime's user-facing custom name (MUL-4217). custom_name
+-- overrides the daemon-proposed `name` for display; passing NULL reverts to
+-- the default. Kept separate from the registration upserts above (which do
+-- name = EXCLUDED.name on every heartbeat) so a custom name is never
+-- clobbered by the daemon. Gated at the handler to owner / workspace admin.
+UPDATE agent_runtime
+SET custom_name = @custom_name, updated_at = now()
+WHERE id = @id
+RETURNING *;
+
+-- name: UpdateAgentRuntimeCustomNameByDaemon :many
+-- Machine-level rename (MUL-4217): applies one custom name to every runtime
+-- sharing a daemon_id in the workspace, since a single machine hosts one
+-- runtime per provider. @owner_id is NULL for workspace owners/admins (rename
+-- the whole machine) or the actor's user id otherwise (only their own
+-- runtimes on that machine), so a member cannot relabel someone else's
+-- runtime that happens to share the host.
+UPDATE agent_runtime
+SET custom_name = @custom_name, updated_at = now()
+WHERE workspace_id = @workspace_id
+  AND daemon_id = @daemon_id
+  AND (@owner_id::uuid IS NULL OR owner_id = @owner_id)
+RETURNING *;
+
+-- name: ListDaemonCustomNames :many
+-- Lists the custom_name of every OTHER runtime on (workspace_id, daemon_id)
+-- (MUL-4217). @exclude_id drops the just-registered row. The caller derives
+-- the machine-level name in Go — the same "all runtimes share one non-null
+-- name" rule the frontend applies in sharedCustomName — so a freshly-added
+-- runtime on an already-named machine can inherit that name and keep the
+-- machine's display name stable. A daemon hosts only a handful of runtimes
+-- (one per provider), so this is a tiny read.
+SELECT custom_name FROM agent_runtime
+WHERE workspace_id = @workspace_id
+  AND daemon_id = @daemon_id
+  AND id <> @exclude_id;
 
 
 -- name: TouchAgentRuntimeLastSeen :execrows
@@ -187,59 +271,73 @@ RETURNING id, workspace_id, owner_id, daemon_id, provider;
 -- poller (watchTaskCancellation) interrupts the running agent gracefully.
 -- Returns the affected rows so the caller can broadcast task:cancelled and
 -- reconcile per-agent status.
+--
+-- The status list must cover EVERY non-terminal status, not just the ones the
+-- daemon is actively working: 'deferred' (migration 128, comment-routing
+-- escalation) was missing here and only went unnoticed because the runtime
+-- delete used to cascade those rows away. Since MUL-5559 the runtime delete
+-- unbinds history rows instead, and agent_task_queue_active_requires_runtime
+-- rejects an active row without a runtime — so a missed status now surfaces as
+-- a failed delete (runtime_delete_not_drained) instead of silent data loss.
 UPDATE agent_task_queue
 SET status = 'cancelled', completed_at = now()
 WHERE (runtime_id = ANY(@runtime_ids::uuid[]) OR agent_id = ANY(@agent_ids::uuid[]))
-  AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
+  AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+RETURNING *;
+
+-- name: CountUndrainedTasksByRuntimeOrAgent :one
+-- Belt-and-braces gate for the runtime-delete transaction: after cancelling,
+-- every task on this runtime OR owned by an agent being unbound must be terminal
+-- (completed_at IS NOT NULL) before the unbind UPDATE runs. The agent-side
+-- predicate must mirror CancelAgentTasksByRuntimeOrAgent: a task can remain
+-- pinned to another runtime after its agent moves. Non-zero means some
+-- non-terminal status escaped the cancel query — the handler aborts with 409
+-- runtime_delete_not_drained rather than letting the CHECK constraint turn it
+-- into an opaque 500, and rather than deleting rows to make it go away.
+SELECT count(*) FROM agent_task_queue
+WHERE (runtime_id = ANY(@runtime_ids::uuid[]) OR agent_id = ANY(@agent_ids::uuid[]))
+  AND completed_at IS NULL;
+
+-- name: UnbindTasksFromRuntime :execrows
+-- Detaches this runtime's task history so deleting the runtime row cannot
+-- cascade it away (agent_task_queue.runtime_id is ON DELETE CASCADE, and
+-- task_message / task_usage / task_token cascade from the task in turn).
+-- Restricted to terminal rows: an active task must keep its runtime, per
+-- agent_task_queue_active_requires_runtime. The caller runs
+-- CancelAgentTasksByRuntimeOrAgent +
+-- CountUndrainedTasksByRuntimeOrAgent first, so at this point "terminal" is
+-- every row on the runtime.
+UPDATE agent_task_queue
+SET runtime_id = NULL
+WHERE runtime_id = $1 AND completed_at IS NOT NULL;
+
+-- name: UnbindUserAgentsFromRuntime :many
+-- MUL-5559: the runtime-delete replacement for archive-then-hard-delete. Every
+-- user agent bound to this runtime becomes unbound (runtime_id IS NULL) and
+-- keeps its row, chats, labels, channel installations and autopilot config.
+--
+-- Deliberately NOT filtered on archived_at: an agent archived earlier is just
+-- as much the user's data as an active one, and hard-deleting it was the same
+-- bug. Deliberately restricted to kind = 'user': system agents are invisible
+-- execution infrastructure with no UI to rebind them (see
+-- DeleteSystemAgentsByRuntime), so leaving them unbound would strand rows no
+-- one can repair.
+UPDATE agent
+SET runtime_id = NULL, updated_at = now()
+WHERE runtime_id = $1 AND kind = 'user'
 RETURNING *;
 
 -- name: DeleteAgentRuntime :exec
 DELETE FROM agent_runtime WHERE id = $1;
 
+-- name: DeleteSystemAgentsByRuntime :exec
+-- System agents are invisible execution infrastructure (for example the Agent
+-- Builder). Remove them before deleting their runtime so the RESTRICT runtime
+-- FK cannot block an otherwise dependency-free delete.
+DELETE FROM agent WHERE runtime_id = $1 AND kind = 'system';
+
 -- name: CountActiveAgentsByRuntime :one
 SELECT count(*) FROM agent WHERE runtime_id = $1 AND archived_at IS NULL;
-
--- name: CountActiveSquadsWithArchivedLeadersByRuntime :one
-SELECT count(*)
-FROM squad
-WHERE archived_at IS NULL
-  AND leader_id IN (
-    SELECT id FROM agent WHERE runtime_id = $1 AND archived_at IS NOT NULL
-  );
-
--- name: DeleteArchivedAgentsByRuntime :exec
-DELETE FROM agent WHERE runtime_id = $1 AND archived_at IS NOT NULL;
-
--- name: PauseAutopilotsByAgentAssignees :exec
--- Pauses every active autopilot whose agent assignee is in the supplied list.
--- Called before hard-deleting archived agents on runtime teardown so the rows
--- do not become dangling (autopilot.assignee_id no longer has an agent FK
--- since migration 096). Status='paused' makes the breakage visible in the UI
--- — operators can re-point the autopilot at a live agent or delete it —
--- rather than silently piling skipped runs.
-UPDATE autopilot
-SET status = 'paused', updated_at = now()
-WHERE status = 'active'
-  AND assignee_type = 'agent'
-  AND assignee_id = ANY(@assignee_ids::uuid[]);
-
--- name: ListArchivedAgentIDsByRuntime :many
--- Companion to DeleteArchivedAgentsByRuntime: enumerates the archived agents
--- about to be hard-deleted so the runtime teardown can pause autopilots that
--- still point at them. Returns ids only — the caller only needs the set.
-SELECT id FROM agent WHERE runtime_id = $1 AND archived_at IS NOT NULL;
-
--- name: DeleteSquadsByArchivedAgentsOnRuntime :exec
--- Removes archived squads whose leader_id references an archived agent on the
--- given runtime. Must run before DeleteArchivedAgentsByRuntime so the RESTRICT
--- FK on squad.leader_id does not block the agent deletion. Active squads are
--- handled separately by CountActiveSquadsWithArchivedLeadersByRuntime, which
--- returns a 409 until the caller archives them or assigns a new leader.
-DELETE FROM squad
-WHERE leader_id IN (
-    SELECT id FROM agent WHERE runtime_id = $1 AND archived_at IS NOT NULL
-)
-  AND archived_at IS NOT NULL;
 
 -- name: FindLegacyRuntimesByDaemonID :many
 -- Looks up runtime rows keyed on a prior (hostname-derived) daemon_id. Used
@@ -292,5 +390,9 @@ WHERE id = $1;
 DELETE FROM agent_runtime
 WHERE status = 'offline'
   AND last_seen_at < now() - make_interval(secs => @stale_seconds::double precision)
-  AND id NOT IN (SELECT DISTINCT runtime_id FROM agent)
+  AND NOT EXISTS (
+    SELECT 1
+    FROM agent
+    WHERE agent.runtime_id = agent_runtime.id
+  )
 RETURNING id, workspace_id;

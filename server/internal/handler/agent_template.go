@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -124,6 +125,17 @@ type CreateAgentFromTemplateRequest struct {
 	Model              string `json:"model,omitempty"`
 	Visibility         string `json:"visibility,omitempty"`
 	MaxConcurrentTasks int32  `json:"max_concurrent_tasks,omitempty"`
+	// PermissionMode + InvocationTargets are the invocation-permission inputs
+	// (MUL-3963). When permission_mode is present it is authoritative and
+	// Visibility is ignored; when absent, legacy Visibility is mapped through
+	// parsePermissionInput ("workspace" -> public_to + workspace target;
+	// "private" or "" -> private). Persisting these fields keeps template
+	// creates aligned with the manual CreateAgent path — without them the
+	// template row lands as `permission_mode='private'` (the SQL default) and
+	// canInvokeAgent silently locks out every non-owner, even if the caller
+	// asked for a workspace-shared agent.
+	PermissionMode    *string                    `json:"permission_mode,omitempty"`
+	InvocationTargets []AgentInvocationTargetDTO `json:"invocation_targets,omitempty"`
 	// Optional overrides — let the picker UI customise the template before
 	// creation without forcing a second round-trip to the detail page.
 	// When nil/empty, the template's own values are used.
@@ -156,7 +168,8 @@ func (h *Handler) CreateAgentFromTemplate(w http.ResponseWriter, r *http.Request
 	}
 
 	var req CreateAgentFromTemplateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	rawFields, err := decodeJSONBodyWithRawFields(r.Body, &req)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -172,8 +185,9 @@ func (h *Handler) CreateAgentFromTemplate(w http.ResponseWriter, r *http.Request
 	if req.Visibility == "" {
 		req.Visibility = "private"
 	}
-	if req.MaxConcurrentTasks == 0 {
-		req.MaxConcurrentTasks = 6
+	if err := defaultAndValidateAgentMaxConcurrentTasks(rawFields, &req.MaxConcurrentTasks); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	tmpl, found := agentTemplates.Get(req.TemplateSlug)
@@ -208,6 +222,20 @@ func (h *Handler) CreateAgentFromTemplate(w http.ResponseWriter, r *http.Request
 	}
 	if !canUseRuntimeForAgent(member, runtime) {
 		writeError(w, http.StatusForbidden, "this runtime is private; only its owner or a workspace admin can create agents on it")
+		return
+	}
+
+	// Resolve invocation permission (MUL-3963) — mirrors CreateAgent so the
+	// two entry points can't drift. permission_mode is authoritative when
+	// present; otherwise legacy visibility is mapped through the same helper
+	// ("workspace" -> public_to + workspace target; "private" -> private).
+	// On create the caller is always the owner, so any submitted targets are
+	// accepted unconditionally.
+	_, hasTargets := rawFields["invocation_targets"]
+	legacyVis := req.Visibility
+	perm, _, permErr := parsePermissionInput(wsUUID, req.PermissionMode, req.InvocationTargets, req.PermissionMode != nil, hasTargets, &legacyVis)
+	if permErr != nil {
+		writeError(w, http.StatusBadRequest, permErr.Error())
 		return
 	}
 
@@ -257,11 +285,13 @@ func (h *Handler) CreateAgentFromTemplate(w http.ResponseWriter, r *http.Request
 	// Fetch only the skills that aren't already in the workspace. fetched[j]
 	// corresponds to toFetchRefs[j], whose original index is toFetchOrigIdx[j].
 	httpClient := &http.Client{Timeout: 30 * time.Second}
+	fetchCtx, cancelFetch := context.WithTimeout(r.Context(), importFetchTimeout)
+	defer cancelFetch()
 	fetchStart := time.Now()
 	var fetched []*importedSkill
 	var failedURLs []string
 	if len(toFetchRefs) > 0 {
-		fetched, failedURLs = fetchTemplateSkillsParallel(httpClient, toFetchRefs)
+		fetched, failedURLs = fetchTemplateSkillsParallel(fetchCtx, httpClient, toFetchRefs)
 	}
 	slog.Info("agent-template create: fetch phase done",
 		append(logger.RequestAttrs(r),
@@ -426,9 +456,9 @@ func (h *Handler) CreateAgentFromTemplate(w http.ResponseWriter, r *http.Request
 	if req.Instructions != nil {
 		instructions = *req.Instructions
 	}
-	avatarURL := pgtype.Text{}
-	if req.AvatarURL != nil && *req.AvatarURL != "" {
-		avatarURL = pgtype.Text{String: *req.AvatarURL, Valid: true}
+	avatarURL, ok := h.newAgentAvatar(w, r, req.AvatarURL)
+	if !ok {
+		return
 	}
 
 	agent, err := qtx.CreateAgent(r.Context(), db.CreateAgentParams{
@@ -440,7 +470,8 @@ func (h *Handler) CreateAgentFromTemplate(w http.ResponseWriter, r *http.Request
 		RuntimeMode:        runtime.RuntimeMode,
 		RuntimeConfig:      rc,
 		RuntimeID:          runtime.ID,
-		Visibility:         req.Visibility,
+		Visibility:         perm.legacyVisibility(),
+		PermissionMode:     perm.mode,
 		MaxConcurrentTasks: req.MaxConcurrentTasks,
 		OwnerID:            creatorUUID,
 		CustomEnv:          ce,
@@ -489,6 +520,23 @@ func (h *Handler) CreateAgentFromTemplate(w http.ResponseWriter, r *http.Request
 			writeError(w, http.StatusInternalServerError, "failed to attach skill: "+err.Error())
 			return
 		}
+	}
+
+	// Persist the invocation allow-list (MUL-3963) inside the same tx as the
+	// agent row so the agent is never visible to callers in a state where the
+	// row exists but its targets are missing. Without this the freshly created
+	// row would default to `permission_mode=private` + zero targets — meaning
+	// canInvokeAgent silently locks out every non-owner even when the caller
+	// asked for a workspace-shared agent (the manual CreateAgent path already
+	// did this; the template path was diverging until MUL-4010).
+	if err := replaceInvocationTargetsWithQueries(r.Context(), qtx, agent.ID, creatorUUID, perm.targets); err != nil {
+		slog.Error("agent-template create: persist invocation targets failed",
+			append(logger.RequestAttrs(r),
+				"agent_id", uuidToString(agent.ID),
+				"error", err,
+			)...)
+		writeError(w, http.StatusInternalServerError, "failed to persist invocation targets: "+err.Error())
+		return
 	}
 
 	// Attach user-supplied extra skills (selected in the create dialog
@@ -540,7 +588,7 @@ func (h *Handler) CreateAgentFromTemplate(w http.ResponseWriter, r *http.Request
 		agent, _ = h.Queries.GetAgent(r.Context(), agent.ID)
 	}
 
-	resp := agentToResponse(agent)
+	resp := h.agentToResponse(agent)
 	// Templates attach skills via AddAgentSkill above, so the freshly built
 	// AgentResponse must reload them — otherwise the create response (and
 	// the agent:created broadcast) would tell clients the agent has no
@@ -550,6 +598,15 @@ func (h *Handler) CreateAgentFromTemplate(w http.ResponseWriter, r *http.Request
 			append(logger.RequestAttrs(r), "error", err, "agent_id", uuidToString(agent.ID))...)
 		writeError(w, http.StatusInternalServerError, "failed to load agent skills")
 		return
+	}
+	// Reflect the invocation-permission state we just persisted (MUL-4010).
+	// Without this the response would still show empty invocation_targets and
+	// derive Visibility from permission_mode alone — so a client that just
+	// asked for `visibility="workspace"` would round-trip to a legacy
+	// "private" and re-render the wrong access badge.
+	if err := h.enrichAgentResponseWithTargets(r.Context(), &resp, agent.ID); err != nil {
+		slog.Warn("agent-template create: load invocation targets for response failed",
+			append(logger.RequestAttrs(r), "error", err, "agent_id", uuidToString(agent.ID))...)
 	}
 	actorType, actorID := h.resolveActor(r, ownerID, workspaceID)
 	h.publish(protocol.EventAgentCreated, workspaceID, actorType, actorID, map[string]any{"agent": resp})
@@ -592,7 +649,7 @@ type templateFetchResult struct {
 // importedSkill, in parallel. Returns the imports in input order; failed_urls
 // is non-nil iff any fetch failed. Logs per-URL timing so we can spot which
 // upstream is the long pole in a slow request.
-func fetchTemplateSkillsParallel(client *http.Client, refs []agenttmpl.TemplateSkillRef) ([]*importedSkill, []string) {
+func fetchTemplateSkillsParallel(ctx context.Context, client *http.Client, refs []agenttmpl.TemplateSkillRef) ([]*importedSkill, []string) {
 	results := make(chan templateFetchResult, len(refs))
 	var wg sync.WaitGroup
 	for i, ref := range refs {
@@ -601,7 +658,7 @@ func fetchTemplateSkillsParallel(client *http.Client, refs []agenttmpl.TemplateS
 			defer wg.Done()
 			start := time.Now()
 			slog.Info("agent-template fetch: start", "index", i, "source_url", ref.SourceURL)
-			imp, err := fetchSkillFromURL(client, ref.SourceURL)
+			imp, err := fetchSkillFromURL(ctx, client, ref.SourceURL)
 			elapsedMs := time.Since(start).Milliseconds()
 			if err != nil {
 				slog.Warn("agent-template fetch: failed",
@@ -646,18 +703,18 @@ func fetchTemplateSkillsParallel(client *http.Client, refs []agenttmpl.TemplateS
 // fetchSkillFromURL dispatches to the right upstream fetcher based on URL.
 // Mirrors the switch inside ImportSkill (skill.go:1566) so both entry points
 // stay in sync.
-func fetchSkillFromURL(client *http.Client, rawURL string) (*importedSkill, error) {
+func fetchSkillFromURL(ctx context.Context, client *http.Client, rawURL string) (*importedSkill, error) {
 	source, normalized, err := detectImportSource(rawURL)
 	if err != nil {
 		return nil, err
 	}
 	switch source {
 	case sourceClawHub:
-		return fetchFromClawHub(client, normalized)
+		return fetchFromClawHub(ctx, client, normalized)
 	case sourceSkillsSh:
-		return fetchFromSkillsSh(client, normalized)
+		return fetchFromSkillsSh(ctx, client, normalized)
 	case sourceGitHub:
-		return fetchFromGitHub(client, normalized)
+		return fetchFromGitHub(ctx, client, normalized)
 	}
 	return nil, fmt.Errorf("unknown import source for %s", rawURL)
 }

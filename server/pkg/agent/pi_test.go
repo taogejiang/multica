@@ -24,12 +24,11 @@ func TestBuildPiArgsNoToolAllowlist(t *testing.T) {
 
 func TestBuildPiArgsBasicFlags(t *testing.T) {
 	args := buildPiArgs("hello world", "/tmp/s.jsonl", ExecOptions{
-		Model:        "anthropic/claude-sonnet-4-20250514",
-		SystemPrompt: "be helpful",
+		Model: "anthropic/claude-sonnet-4-20250514",
 	}, slog.Default())
 
 	joined := strings.Join(args, " ")
-	for _, want := range []string{"-p", "--mode json", "--session /tmp/s.jsonl", "--provider anthropic", "--model claude-sonnet-4-20250514", "--append-system-prompt"} {
+	for _, want := range []string{"-p", "--mode json", "--session /tmp/s.jsonl", "--provider anthropic", "--model claude-sonnet-4-20250514"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("expected %q in args, got: %v", want, args)
 		}
@@ -38,6 +37,24 @@ func TestBuildPiArgsBasicFlags(t *testing.T) {
 	// Prompt must be the last positional argument.
 	if args[len(args)-1] != "hello world" {
 		t.Errorf("prompt should be last arg, got %q", args[len(args)-1])
+	}
+}
+
+// Pi reads the per-task AGENTS.md the daemon writes into the workdir, so the
+// daemon never populates SystemPrompt for it (providerNeedsInlineSystemPrompt).
+// Forwarding it anyway would duplicate the whole runtime brief on every turn.
+func TestBuildPiArgsIgnoresSystemPrompt(t *testing.T) {
+	args := buildPiArgs("hello world", "/tmp/s.jsonl", ExecOptions{
+		SystemPrompt: "the entire multica runtime brief",
+	}, slog.Default())
+
+	for _, a := range args {
+		if a == "--append-system-prompt" {
+			t.Fatalf("unexpected --append-system-prompt in args: %v", args)
+		}
+		if a == "the entire multica runtime brief" {
+			t.Fatalf("SystemPrompt leaked into args: %v", args)
+		}
 	}
 }
 
@@ -113,6 +130,72 @@ func TestPiExecuteAttachesStdinPipe(t *testing.T) {
 		}
 		if result.Status != "completed" {
 			t.Fatalf("expected status=completed (stdin attached as fifo), got %q (error=%q)", result.Status, result.Error)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+}
+
+// piEventStreamScript builds a sh script that prints each JSON event on
+// its own stdout line. Fixtures must not contain single quotes.
+func piEventStreamScript(events []string) string {
+	var b strings.Builder
+	b.WriteString("#!/bin/sh\n")
+	for _, e := range events {
+		b.WriteString("printf '%s\\n' '")
+		b.WriteString(e)
+		b.WriteString("'\n")
+	}
+	return b.String()
+}
+
+// TestPiExecuteRetainsOnlyLastTurnOutput verifies turn_start resets the
+// output buffer so Result.Output keeps only the final turn's text.
+func TestPiExecuteRetainsOnlyLastTurnOutput(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	events := []string{
+		`{"type":"agent_start"}`,
+		`{"type":"turn_start"}`,
+		`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"intermediate"}}`,
+		`{"type":"tool_execution_start","toolCallId":"call_1","toolName":"bash","args":{"command":"echo hi"}}`,
+		`{"type":"tool_execution_end","toolCallId":"call_1","toolName":"bash","result":{"content":[{"type":"text","text":"hi"}]},"isError":false}`,
+		`{"type":"turn_end","message":{"role":"assistant","model":"test","usage":{"input":1,"output":1}}}`,
+		`{"type":"turn_start"}`,
+		`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"final"}}`,
+		`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":" "}}`,
+		`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"answer"}}`,
+		`{"type":"turn_end","message":{"role":"assistant","model":"test","usage":{"input":2,"output":2}}}`,
+	}
+	fakePath := filepath.Join(t.TempDir(), "pi")
+	writeTestExecutable(t, fakePath, []byte(piEventStreamScript(events)))
+
+	backend, err := New("pi", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new pi backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+
+	select {
+	case result := <-session.Result:
+		if result.Status != "completed" {
+			t.Fatalf("expected status=completed, got %q (error=%q)", result.Status, result.Error)
+		}
+		if result.Output != "final answer" {
+			t.Fatalf("Output: got %q, want %q", result.Output, "final answer")
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("timeout waiting for result")

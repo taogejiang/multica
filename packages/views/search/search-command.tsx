@@ -11,20 +11,15 @@ import {
   MessageSquare,
   Plus,
   SearchIcon,
-  Inbox,
-  CircleUser,
-  ListTodo,
-  FolderKanban,
-  Bot,
+  ListChevronsDownUp,
+  ListChevronsUpDown,
   Monitor,
   Moon,
   Sun,
-  BookOpenText,
-  Settings,
   type LucideIcon,
 } from "lucide-react";
 import { Command as CommandPrimitive } from "cmdk";
-import { useQueries, useQuery } from "@tanstack/react-query";
+import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import type {
   MemberWithUser,
@@ -35,20 +30,26 @@ import { api } from "@multica/core/api";
 import {
   openCreateIssueWithPreference,
   selectRecentIssues,
+  useCommentCollapseStore,
   useRecentIssuesStore,
+  useResolvedExpandStore,
 } from "@multica/core/issues/stores";
-import { issueDetailOptions } from "@multica/core/issues/queries";
+import { issueDetailOptions, issueTimelineOptions } from "@multica/core/issues/queries";
 import { useWorkspaceId } from "@multica/core";
 import { useWorkspacePaths } from "@multica/core/paths";
 import type { WorkspacePaths } from "@multica/core/paths";
 import { useModalStore } from "@multica/core/modals";
+import { createShortcutChord } from "@multica/core/shortcuts";
 import { memberListOptions } from "@multica/core/workspace/queries";
 import { resolvePublicFileUrl } from "@multica/core/workspace/avatar-url";
 import { StatusIcon } from "../issues/components";
+import { resolvedThreadRootIds, rootCommentIds } from "../issues/components/thread-utils";
 import { ProjectIcon } from "../projects/components/project-icon";
+import { routeIconForPath } from "../layout/route-icon-components";
 import { PROJECT_STATUS_CONFIG } from "@multica/core/projects/config";
 import type { ProjectStatus } from "@multica/core/types";
 import { ActorAvatar } from "../common/actor-avatar";
+import { ShortcutKeycaps } from "../common/shortcut-keycaps";
 import { ActorAvatar as ActorAvatarBase } from "@multica/ui/components/common/actor-avatar";
 import {
   Dialog,
@@ -78,10 +79,12 @@ type NavKey =
   | "skills"
   | "settings";
 
+// No `icon` field: like the sidebar nav, a page's icon is derived from its
+// destination path via routeIconForPath, so all navigation surfaces show the
+// same icon for the same route.
 interface NavPage {
   key: NavKey;
   label: string;
-  icon: LucideIcon;
   keywords: string[];
 }
 
@@ -117,7 +120,7 @@ function IssueAssigneeAvatar({
     <ActorAvatar
       actorType={assigneeType}
       actorId={assigneeId}
-      size={20}
+      size="sm"
       profileLink={false}
       className="shrink-0"
     />
@@ -141,14 +144,14 @@ interface SearchResults {
 export function SearchCommand() {
   const { t } = useT("search");
   const navPages: NavPage[] = [
-    { key: "inbox", label: t(($) => $.pages.inbox), icon: Inbox, keywords: ["inbox", "notifications", "收件箱"] },
-    { key: "myIssues", label: t(($) => $.pages.my_issues), icon: CircleUser, keywords: ["my", "issues", "assigned", "我的"] },
-    { key: "issues", label: t(($) => $.pages.issues), icon: ListTodo, keywords: ["issues", "tasks", "bugs"] },
-    { key: "projects", label: t(($) => $.pages.projects), icon: FolderKanban, keywords: ["projects", "kanban", "项目"] },
-    { key: "agents", label: t(($) => $.pages.agents), icon: Bot, keywords: ["agents", "bots", "ai"] },
-    { key: "runtimes", label: t(($) => $.pages.runtimes), icon: Monitor, keywords: ["runtimes", "environments"] },
-    { key: "skills", label: t(($) => $.pages.skills), icon: BookOpenText, keywords: ["skills", "library"] },
-    { key: "settings", label: t(($) => $.pages.settings), icon: Settings, keywords: ["settings", "config", "preferences", "设置"] },
+    { key: "inbox", label: t(($) => $.pages.inbox), keywords: ["inbox", "notifications", "收件箱"] },
+    { key: "myIssues", label: t(($) => $.pages.my_issues), keywords: ["my", "issues", "assigned", "我的"] },
+    { key: "issues", label: t(($) => $.pages.issues), keywords: ["issues", "tasks", "bugs"] },
+    { key: "projects", label: t(($) => $.pages.projects), keywords: ["projects", "kanban", "项目"] },
+    { key: "agents", label: t(($) => $.pages.agents), keywords: ["agents", "bots", "ai"] },
+    { key: "runtimes", label: t(($) => $.pages.runtimes), keywords: ["runtimes", "environments"] },
+    { key: "skills", label: t(($) => $.pages.skills), keywords: ["skills", "library"] },
+    { key: "settings", label: t(($) => $.pages.settings), keywords: ["settings", "config", "preferences", "设置"] },
   ];
   const { push, pathname, getShareableUrl } = useNavigation();
   const open = useSearchStore((s) => s.open);
@@ -199,6 +202,7 @@ export function SearchCommand() {
     ...issueDetailOptions(wsId, currentIssueId ?? ""),
     enabled: !!currentIssueId,
   });
+  const queryClient = useQueryClient();
 
   const commands = useMemo<CommandItem[]>(() => {
     const activeThemeCheck = (value: ThemeValue) =>
@@ -232,7 +236,7 @@ export function SearchCommand() {
       },
     ];
 
-    if (currentIssue) {
+    if (currentIssueId && currentIssue) {
       const identifier = currentIssue.identifier;
       items.push(
         {
@@ -256,6 +260,46 @@ export function SearchCommand() {
             void copyText(identifier).then((ok) => {
               if (ok) toast.success(t(($) => $.toast.copied_identifier, { identifier }));
             });
+            setOpen(false);
+          },
+        },
+        {
+          key: "fold-all-comments",
+          label: t(($) => $.commands.fold_all_comments),
+          icon: ListChevronsDownUp,
+          keywords: ["fold", "collapse", "comments", "收起", "折叠", "评论"],
+          onSelect: () => {
+            // The timeline is already cached whenever the issue page has
+            // rendered; ensureQueryData only fetches on a cold cache. If it
+            // still can't load, no comments are on screen — dropping the
+            // action matches the visible state.
+            void queryClient
+              .ensureQueryData(issueTimelineOptions(currentIssueId))
+              .then((entries) => {
+                useCommentCollapseStore
+                  .getState()
+                  .collapseAll(currentIssueId, rootCommentIds(entries));
+                useResolvedExpandStore.getState().collapseAll(currentIssueId);
+              })
+              .catch(() => {});
+            setOpen(false);
+          },
+        },
+        {
+          key: "unfold-all-comments",
+          label: t(($) => $.commands.unfold_all_comments),
+          icon: ListChevronsUpDown,
+          keywords: ["unfold", "expand", "comments", "展开", "评论"],
+          onSelect: () => {
+            void queryClient
+              .ensureQueryData(issueTimelineOptions(currentIssueId))
+              .then((entries) => {
+                useCommentCollapseStore.getState().expandAll(currentIssueId);
+                useResolvedExpandStore
+                  .getState()
+                  .expandAll(currentIssueId, resolvedThreadRootIds(entries));
+              })
+              .catch(() => {});
             setOpen(false);
           },
         },
@@ -299,7 +343,7 @@ export function SearchCommand() {
     );
 
     return items;
-  }, [currentIssue, getShareableUrl, pathname, setOpen, setTheme, theme, t]);
+  }, [currentIssue, currentIssueId, getShareableUrl, pathname, queryClient, setOpen, setTheme, theme, t]);
 
   const filteredCommands = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -332,18 +376,6 @@ export function SearchCommand() {
     results.issues.length > 0 ||
     results.projects.length > 0 ||
     filteredMembers.length > 0;
-
-  // Global Cmd+K / Ctrl+K shortcut
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "k" && (e.metaKey || e.ctrlKey)) {
-        e.preventDefault();
-        useSearchStore.getState().toggle();
-      }
-    };
-    document.addEventListener("keydown", handleKeyDown);
-    return () => document.removeEventListener("keydown", handleKeyDown);
-  }, []);
 
   // Close on single ESC — capture phase fires before base-ui Dialog's handlers
   useEffect(() => {
@@ -481,11 +513,19 @@ export function SearchCommand() {
               placeholder={t(($) => $.placeholder)}
               value={query}
               onValueChange={handleValueChange}
-              className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+              onKeyDown={(e) => {
+                // cmdk's root handler intercepts Home/End for list navigation;
+                // stop propagation so the browser moves the text caret instead.
+                if (e.key === "Home" || e.key === "End") {
+                  e.stopPropagation();
+                }
+              }}
+              className="flex-1 bg-transparent text-body outline-none placeholder:text-muted-foreground"
             />
-            <kbd className="hidden shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground sm:inline">
-              ESC
-            </kbd>
+            <ShortcutKeycaps
+              shortcut={createShortcutChord("Escape")}
+              className="hidden shrink-0 sm:inline-flex"
+            />
           </div>
 
           {/* Results list */}
@@ -493,29 +533,32 @@ export function SearchCommand() {
             {/* Pages section — only shown when query matches */}
             {filteredPages.length > 0 && (
               <CommandPrimitive.Group className="p-2">
-                <div className="px-3 py-1.5 text-xs font-medium text-muted-foreground">
+                <div className="px-3 py-1.5 text-caption font-medium text-muted-foreground">
                   {t(($) => $.groups.pages)}
                 </div>
-                {filteredPages.map((page) => (
+                {filteredPages.map((page) => {
+                  const PageIcon = routeIconForPath(p[page.key]());
+                  return (
                   <CommandPrimitive.Item
                     key={page.key}
                     value={`page:${page.key}`}
                     onSelect={() => handlePageSelect(page.key)}
-                    className="flex cursor-default select-none items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50 data-selected:bg-accent"
+                    className="flex cursor-default select-none items-center gap-2.5 rounded-lg px-3 py-2.5 text-body outline-none data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50 data-selected:bg-accent"
                   >
-                    <page.icon className="size-4 shrink-0 text-muted-foreground" />
+                    <PageIcon className="size-4 shrink-0 text-muted-foreground" />
                     <span className="truncate">
                       <HighlightText text={page.label} query={query} />
                     </span>
                   </CommandPrimitive.Item>
-                ))}
+                  );
+                })}
               </CommandPrimitive.Group>
             )}
 
             {/* Commands section — New Issue / New Project / Copy link / Theme, only shown when query matches */}
             {filteredCommands.length > 0 && (
               <CommandPrimitive.Group className="p-2">
-                <div className="px-3 py-1.5 text-xs font-medium text-muted-foreground">
+                <div className="px-3 py-1.5 text-caption font-medium text-muted-foreground">
                   {t(($) => $.groups.commands)}
                 </div>
                 {filteredCommands.map((cmd) => (
@@ -523,7 +566,7 @@ export function SearchCommand() {
                     key={cmd.key}
                     value={`command:${cmd.key}`}
                     onSelect={cmd.onSelect}
-                    className="flex cursor-default select-none items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50 data-selected:bg-accent"
+                    className="flex cursor-default select-none items-center gap-2.5 rounded-lg px-3 py-2.5 text-body outline-none data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50 data-selected:bg-accent"
                   >
                     <cmd.icon className="size-4 shrink-0 text-muted-foreground" />
                     <span className="truncate">
@@ -537,7 +580,7 @@ export function SearchCommand() {
 
             {filteredMembers.length > 0 && (
               <CommandPrimitive.Group className="p-2">
-                <div className="px-3 py-1.5 text-xs font-medium text-muted-foreground">
+                <div className="px-3 py-1.5 text-caption font-medium text-muted-foreground">
                   {t(($) => $.groups.members)}
                 </div>
                 {filteredMembers.map((member) => (
@@ -545,19 +588,19 @@ export function SearchCommand() {
                     key={member.user_id}
                     value={`member:${member.user_id}`}
                     onSelect={() => handleMemberSelect(member.user_id)}
-                    className="flex cursor-default select-none items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50 data-selected:bg-accent"
+                    className="flex cursor-default select-none items-center gap-2.5 rounded-lg px-3 py-2.5 text-body outline-none data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50 data-selected:bg-accent"
                   >
                     <ActorAvatarBase
                       name={member.name}
                       initials={memberInitials(member.name)}
                       avatarUrl={resolvePublicFileUrl(member.avatar_url)}
-                      size={22}
+                      size="md"
                     />
                     <div className="min-w-0 flex-1">
                       <div className="truncate">
                         <HighlightText text={member.name} query={query} />
                       </div>
-                      <div className="truncate text-xs text-muted-foreground">
+                      <div className="truncate text-caption text-muted-foreground">
                         <HighlightText text={member.email} query={query} />
                       </div>
                     </div>
@@ -577,7 +620,7 @@ export function SearchCommand() {
               !hasResults &&
               filteredPages.length === 0 &&
               filteredCommands.length === 0 && (
-                <CommandPrimitive.Empty className="py-10 text-center text-sm text-muted-foreground">
+                <CommandPrimitive.Empty className="py-10 text-center text-body text-muted-foreground">
                   {t(($) => $.empty.no_results)}
                 </CommandPrimitive.Empty>
               )}
@@ -585,14 +628,14 @@ export function SearchCommand() {
             {!isLoading && results.projects.length > 0 && (
               <CommandPrimitive.Group
                 heading={t(($) => $.groups.projects)}
-                className="p-2 [&_[cmdk-group-heading]]:px-3 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-xs [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:text-muted-foreground"
+                className="p-2 [&_[cmdk-group-heading]]:px-3 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-caption [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:text-muted-foreground"
               >
                 {results.projects.map((project) => (
                   <CommandPrimitive.Item
                     key={`project:${project.id}`}
                     value={`project:${project.id}`}
                     onSelect={handleSelect}
-                    className="flex cursor-default select-none flex-col gap-1 rounded-lg px-3 py-2.5 text-sm outline-none data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50 data-selected:bg-accent"
+                    className="flex cursor-default select-none flex-col gap-1 rounded-lg px-3 py-2.5 text-body outline-none data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50 data-selected:bg-accent"
                   >
                     <div className="flex items-center gap-2.5">
                       <ProjectIcon project={project} size="md" />
@@ -600,7 +643,7 @@ export function SearchCommand() {
                         <HighlightText text={project.title} query={query} />
                       </span>
                       <span
-                        className={`ml-auto text-xs shrink-0 ${PROJECT_STATUS_CONFIG[project.status as ProjectStatus]?.color ?? "text-muted-foreground"}`}
+                        className={`ml-auto text-caption shrink-0 ${PROJECT_STATUS_CONFIG[project.status as ProjectStatus]?.color ?? "text-muted-foreground"}`}
                       >
                         {PROJECT_STATUS_CONFIG[project.status as ProjectStatus]?.label ?? project.status}
                       </span>
@@ -608,7 +651,7 @@ export function SearchCommand() {
                     {project.match_source === "description" &&
                       project.matched_snippet && (
                         <div className="flex items-start gap-2 pl-[26px]">
-                          <span className="text-xs text-muted-foreground truncate">
+                          <span className="text-caption text-muted-foreground truncate">
                             <HighlightText
                               text={project.matched_snippet}
                               query={query}
@@ -624,21 +667,21 @@ export function SearchCommand() {
             {!isLoading && results.issues.length > 0 && (
               <CommandPrimitive.Group
                 heading={t(($) => $.groups.issues)}
-                className="p-2 [&_[cmdk-group-heading]]:px-3 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-xs [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:text-muted-foreground"
+                className="p-2 [&_[cmdk-group-heading]]:px-3 [&_[cmdk-group-heading]]:py-1.5 [&_[cmdk-group-heading]]:text-caption [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:text-muted-foreground"
               >
                 {results.issues.map((issue) => (
                   <CommandPrimitive.Item
                     key={issue.id}
                     value={issue.id}
                     onSelect={handleSelect}
-                    className="flex cursor-default select-none flex-col gap-1 rounded-lg px-3 py-2.5 text-sm outline-none data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50 data-selected:bg-accent"
+                    className="flex cursor-default select-none flex-col gap-1 rounded-lg px-3 py-2.5 text-body outline-none data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50 data-selected:bg-accent"
                   >
                     <div className="flex items-center gap-2.5">
                       <StatusIcon
                         status={issue.status}
                         className="size-4 shrink-0"
                       />
-                      <span className="text-xs text-muted-foreground shrink-0">
+                      <span className="text-caption text-muted-foreground shrink-0">
                         {issue.identifier}
                       </span>
                       <span className="min-w-0 flex-1 truncate">
@@ -652,7 +695,7 @@ export function SearchCommand() {
                     {issue.matched_description_snippet && (
                       <div className="flex items-start gap-2 pl-[26px]">
                         <FileText className="size-3 shrink-0 text-muted-foreground mt-0.5" />
-                        <span className="text-xs text-muted-foreground truncate">
+                        <span className="text-caption text-muted-foreground truncate">
                           <HighlightText
                             text={issue.matched_description_snippet}
                             query={query}
@@ -663,7 +706,7 @@ export function SearchCommand() {
                     {issue.matched_comment_snippet && (
                       <div className="flex items-start gap-2 pl-[26px]">
                         <MessageSquare className="size-3 shrink-0 text-muted-foreground mt-0.5" />
-                        <span className="text-xs text-muted-foreground truncate">
+                        <span className="text-caption text-muted-foreground truncate">
                           <HighlightText
                             text={issue.matched_comment_snippet}
                             query={query}
@@ -678,7 +721,7 @@ export function SearchCommand() {
 
             {!isLoading && !query.trim() && recentIssues.length > 0 && (
               <CommandPrimitive.Group className="p-2">
-                <div className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-muted-foreground">
+                <div className="flex items-center gap-2 px-3 py-1.5 text-caption font-medium text-muted-foreground">
                   <Clock className="size-3" />
                   <span>{t(($) => $.groups.recent)}</span>
                 </div>
@@ -687,13 +730,13 @@ export function SearchCommand() {
                     key={item.id}
                     value={item.id}
                     onSelect={handleSelect}
-                    className="flex cursor-default select-none items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50 data-selected:bg-accent"
+                    className="flex cursor-default select-none items-center gap-2.5 rounded-lg px-3 py-2.5 text-body outline-none data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50 data-selected:bg-accent"
                   >
                     <StatusIcon
                       status={item.status}
                       className="size-4 shrink-0"
                     />
-                    <span className="text-xs text-muted-foreground shrink-0">
+                    <span className="text-caption text-muted-foreground shrink-0">
                       {item.identifier}
                     </span>
                     <span className="min-w-0 flex-1 truncate">{item.title}</span>
@@ -707,7 +750,7 @@ export function SearchCommand() {
             )}
 
             {!isLoading && !query.trim() && recentIssues.length === 0 && (
-              <div className="px-5 py-4 text-center text-xs text-muted-foreground">
+              <div className="px-5 py-4 text-center text-caption text-muted-foreground">
                 {t(($) => $.empty.type_to_search)}
               </div>
             )}

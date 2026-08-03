@@ -26,9 +26,11 @@ function fireLongTask(duration: number) {
 async function load() {
   vi.resetModules();
   const mod = await import("./freeze-watchdog");
+  const { setDiagnosticRoute } = await import("./diagnostic-context");
   const { captureEvent } = await import("../analytics");
   return {
     installFreezeWatchdog: mod.installFreezeWatchdog,
+    setDiagnosticRoute,
     captureEvent: captureEvent as unknown as ReturnType<typeof vi.fn>,
   };
 }
@@ -45,6 +47,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.clearAllMocks();
+  vi.useRealTimers();
 });
 
 describe("installFreezeWatchdog", () => {
@@ -60,6 +63,35 @@ describe("installFreezeWatchdog", () => {
       duration_ms: 2300,
       path: "/acme/issues",
     });
+  });
+
+  // Desktop runs a memory router, so `location.pathname` there is the packaged
+  // index.html path and identifies no page at all. The shell publishes its real
+  // route instead; web publishes nothing and keeps the URL.
+  it("prefers the published diagnostic route over location.pathname", async () => {
+    const { installFreezeWatchdog, setDiagnosticRoute, captureEvent } = await load();
+    setDiagnosticRoute("/:slug/issues/:id");
+    installFreezeWatchdog();
+
+    fireLongTask(2300);
+
+    expect(captureEvent).toHaveBeenCalledWith("client_unresponsive", {
+      source: "longtask",
+      duration_ms: 2300,
+      path: "/:slug/issues/:id",
+    });
+  });
+
+  it("falls back to location.pathname when no route was published (web)", async () => {
+    const { installFreezeWatchdog, captureEvent } = await load();
+    installFreezeWatchdog();
+
+    fireLongTask(2300);
+
+    expect(captureEvent).toHaveBeenCalledWith(
+      "client_unresponsive",
+      expect.objectContaining({ path: "/acme/issues" }),
+    );
   });
 
   it("ignores blocks below the threshold (normal render cost)", async () => {
@@ -95,5 +127,39 @@ describe("installFreezeWatchdog", () => {
     const { installFreezeWatchdog } = await load();
 
     expect(() => installFreezeWatchdog()).not.toThrow();
+  });
+
+  it("emits at most one client_unresponsive per 60s cooldown window", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    const { installFreezeWatchdog, captureEvent } = await load();
+    installFreezeWatchdog();
+
+    // A sustained freeze arrives as several long-task entries back to back.
+    fireLongTask(2500);
+    fireLongTask(2500);
+    fireLongTask(3000);
+
+    expect(captureEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it("emits again only after the cooldown window elapses", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    const { installFreezeWatchdog, captureEvent } = await load();
+    installFreezeWatchdog();
+
+    fireLongTask(2500);
+    expect(captureEvent).toHaveBeenCalledTimes(1);
+
+    // Still inside the window → suppressed.
+    vi.advanceTimersByTime(59_999);
+    fireLongTask(2500);
+    expect(captureEvent).toHaveBeenCalledTimes(1);
+
+    // Window elapsed → emits again.
+    vi.advanceTimersByTime(1);
+    fireLongTask(2500);
+    expect(captureEvent).toHaveBeenCalledTimes(2);
   });
 });

@@ -1,24 +1,47 @@
 # Product Analytics
 
-This document is the source of truth for the analytics events Multica ships
-to PostHog. Events feed the acquisition → activation → expansion funnel that
-drives our weekly Active Workspaces (WAW) north-star metric.
+Multica's product analytics live in the **operational database** and in
+**Prometheus / Grafana**. This document is the catalogue of instrumentation and
+its history.
 
-See [MUL-1122](https://github.com/multica-ai/multica) for the design context.
+See [MUL-1122](https://github.com/multica-ai/multica) for the original design
+context and [MUL-4127](https://github.com/multica-ai/multica) for the PostHog
+retirement below.
 
-> **PostHog is reserved for user/product-behaviour events.** High-volume
-> operational / execution-lifecycle telemetry — runtime lifecycle
-> (`runtime_registered` / `runtime_ready` / `runtime_failed` /
-> `runtime_offline`), the agent task lifecycle (`agent_task_*`), and autopilot
-> run lifecycle (`autopilot_run_started` / `autopilot_run_completed` /
-> `autopilot_run_failed`) — is **Prometheus-only** and is **not** shipped to
-> PostHog. Grafana already covers it and the per-event PostHog ingestion cost
-> (these events dominate volume and bill at the identified-event rate) is not
-> justified. The runtime/autopilot events are flagged by
-> `analytics.IsMetricsOnly`, which `metrics.RecordEvent` consults to skip the
-> PostHog `Capture` while still incrementing the Prometheus counter; the
-> `agent_task_*` lifecycle is recorded straight to Prometheus via the typed
-> `BusinessMetrics.RecordTask*` methods and has no `analytics.Event` at all.
+> **MUL-4127 — PostHog retired for product analytics.** PostHog had become a
+> chaotic, largely-unused second copy of data we already query from the DB, so
+> the redundant instrumentation was removed:
+>
+> - **Every server-side event is now Prometheus-only.** `signup`,
+>   `workspace_created`, `issue_created`, `issue_executed`, `chat_message_sent`,
+>   `team_invite_sent` / `team_invite_accepted`, `onboarding_started` /
+>   `onboarding_questionnaire_submitted` / `onboarding_completed`,
+>   `agent_created`, `cloud_waitlist_joined`, `feedback_submitted`,
+>   `contact_sales_submitted`, `squad_created`, `autopilot_created` — all are
+>   now flagged by `analytics.IsMetricsOnly`, so `metrics.RecordEvent`
+>   increments the Grafana counter but no longer ships to PostHog. The
+>   `analytics.*` event constructors are retained solely to drive those
+>   Prometheus counters; the underlying DB rows remain the source of truth. The
+>   runtime lifecycle (`runtime_*`), autopilot run lifecycle
+>   (`autopilot_run_*`), and `agent_task_*` were already Prometheus-only.
+> - **The frontend funnel instrumentation was removed**: `$pageview`,
+>   `download_intent_expressed` / `download_page_viewed` / `download_initiated`,
+>   the frontend `onboarding_started` mirror, `onboarding_runtime_path_selected`,
+>   `onboarding_runtime_detected`, `feedback_opened`, and the
+>   `source_backfill_*` events.
+> - **What still ships to PostHog (frontend only):** `$exception` autocapture
+>   (with `before_send` redaction + dedupe) and the desktop stability events
+>   `client_crash` / `client_unresponsive` — error / crash monitoring that has
+>   no DB equivalent. Identity (`$identify` / `$set`) is retained only to attach
+>   those.
+> - The `multica_signup_source` attribution cookie (`captureSignupSource`,
+>   independent of `$pageview`) is kept: it still feeds the `signup_source`
+>   Prometheus label. Persisting the raw source-channel / country to the DB —
+>   the one signal PostHog uniquely held — is tracked separately.
+>
+> The per-event sections below document the historical shapes for reference; the
+> server events still describe the `analytics.Event` that drives the Prometheus
+> counter, just no longer a PostHog contract.
 
 ## Configuration
 
@@ -97,18 +120,24 @@ handler → analytics.Client.Capture(Event)   ← non-blocking, returns immediat
   `$set_once` only for values that must never be overwritten (email,
   initial attribution, first-completion timestamp).
 
-## Taxonomy
+## Taxonomy (historical)
 
-Every event is assigned to one dashboard category:
+These categories described the PostHog dashboards each event once fed. After
+MUL-4127 those dashboards are retired: server events are Prometheus-only (DB is
+the source of truth) and the frontend funnel events were deleted. The `Status`
+column records where each event stands now.
 
-| Category | Events |
-|---|---|
-| `core_loop` | `workspace_created`, `agent_created`, `issue_created`, `chat_message_sent`, `issue_executed`, `autopilot_created`, `squad_created` |
-| `onboarding_support` | `onboarding_started`, `onboarding_questionnaire_submitted`, `onboarding_completed`, `onboarding_runtime_path_selected`, `onboarding_runtime_detected` |
-| `acquisition` | `signup`, `download_intent_expressed`, `download_page_viewed`, `download_initiated`, `cloud_waitlist_joined`, `contact_sales_submitted` |
-| `ops_feedback` | `feedback_opened`, `feedback_submitted` |
-| `system/noise` | `$pageview`, `$set`, `$identify`, `$autocapture`, `$rageclick` |
-| `operational (Prometheus-only — NOT in PostHog)` | `runtime_registered`, `runtime_ready`, `runtime_failed`, `runtime_offline`, `agent_task_queued`, `agent_task_dispatched`, `agent_task_started`, `agent_task_completed`, `agent_task_failed`, `agent_task_cancelled`, `autopilot_run_started`, `autopilot_run_completed`, `autopilot_run_failed` |
+| Category | Events | Status after MUL-4127 |
+|---|---|---|
+| `core_loop` | `workspace_created`, `agent_created`, `issue_created`, `chat_message_sent`, `issue_executed`, `autopilot_created`, `squad_created` | Prometheus-only |
+| `onboarding_support` (server) | `onboarding_started`, `onboarding_questionnaire_submitted`, `onboarding_completed` | Prometheus-only |
+| `onboarding_support` (frontend) | frontend `onboarding_started` mirror, `onboarding_runtime_path_selected`, `onboarding_runtime_detected` | **Removed** |
+| `acquisition` (server) | `signup`, `cloud_waitlist_joined`, `contact_sales_submitted` | Prometheus-only |
+| `acquisition` (frontend) | `download_intent_expressed`, `download_page_viewed`, `download_initiated` | **Removed** |
+| `ops_feedback` | `feedback_submitted` (server), `feedback_opened` (frontend) | server → Prometheus-only; frontend **removed** |
+| `attribution backfill` (frontend) | `source_backfill_shown` / `_submitted` / `_skipped` / `_dismissed` | **Removed** (modal kept; PATCHes DB) |
+| **still in PostHog (frontend only)** | `$exception`, `client_crash`, `client_unresponsive`, `$identify`, `$set` | **Shipped** |
+| `operational` (already Prometheus-only) | `runtime_registered/ready/failed/offline`, `agent_task_*`, `autopilot_run_started/completed/failed` | Prometheus-only |
 
 The v0 core dashboard must use only `core_loop` plus the specific
 `onboarding_support` steps used by the activation funnel. Acquisition,
@@ -157,12 +186,13 @@ OAuth entry points (`findOrCreateUser` is the single emission site).
 | `signup_source` | string | Opaque attribution bundle from the frontend cookie `multica_signup_source` (UTM + referrer). Empty when the cookie is absent. |
 | `auth_method` | string | Optional. `"google"` for Google OAuth signups. Absent for verification-code signups. |
 
-Person properties set with `$set_once`:
+Historical PostHog person properties (`$set_once`) — **no longer emitted** since
+MUL-4127, because `signup` is now Prometheus-only and never reaches PostHog:
 
 | Property | Type | Description |
 |---|---|---|
-| `email` | string | Full email. Never broadcast per-event. |
-| `signup_source` | string | Same as above; kept on the person for later segmentation. |
+| `email` | string | Full email. Was never broadcast per-event. |
+| `signup_source` | string | Attribution bundle. Today only its bucketed form survives, as the `multica_signup_total{signup_source}` Prometheus label (see `NormalizeSignupSource`); it is no longer set as a person property for segmentation. |
 
 ### `workspace_created`
 
@@ -371,11 +401,12 @@ emit `n=1`. PostHog answers the same question at query time via
 and funnel steps of the form "workspace has had ≥2 `issue_executed`
 events" are expressible without the property. No information is lost.
 
-`issue_executed` is the canonical **PostHog** core-loop success signal (the
-`agent_task_*` lifecycle that previously served per-task success dashboards is
-now Prometheus-only). Per-task completion counts live in Grafana via
-`BusinessMetrics.RecordTaskTerminal`; use `issue_executed` for the
-PostHog-side activation funnel and filter by `source` as needed.
+`issue_executed` is the canonical core-loop success signal. Since MUL-4127 it is
+metrics-only like every server event: recorded to Prometheus as
+`multica_issue_executed_total{source}` (not PostHog) and backed in the DB by
+`issue.first_executed_at`. Per-task completion counts live in Grafana via
+`BusinessMetrics.RecordTaskTerminal`; use `multica_issue_executed_total` for the
+activation funnel and break down by `source` as needed.
 
 ### `team_invite_sent`
 
@@ -531,6 +562,14 @@ sent from a pre-workspace surface.
 
 ### Frontend-only events
 
+> **Removed in MUL-4127**, except `$exception` (unchanged) and the
+> `client_crash` / `client_unresponsive` desktop stability events (documented in
+> `packages/core/diagnostics`). `$pageview`, `download_intent_expressed`,
+> `download_page_viewed`, `download_initiated`, `onboarding_runtime_path_selected`,
+> `onboarding_runtime_detected`, the frontend `onboarding_started` mirror,
+> `feedback_opened`, and `source_backfill_*` no longer fire. The descriptions
+> below are kept as historical reference only.
+
 - `$pageview` — fired by the web tracker
   (`apps/web/components/pageview-tracker.tsx`) on Next.js App Router
   **pathname** changes, and by the desktop tracker
@@ -676,9 +715,120 @@ Compare against the equivalent Prometheus counter in Grafana. The expected
 difference should be near zero; sustained drift means either an emission site
 is missing or the metrics pipeline is unhealthy.
 
-On the PostHog side, `issue_executed` remains the product-level success signal
-(at most one per issue) and can be reconciled against
-`issue.first_executed_at` if needed.
+`issue_executed` remains the product-level success signal (at most one per
+issue). Since MUL-4127 it is Prometheus-only, so reconcile
+`multica_issue_executed_total` against `issue.first_executed_at` rather than a
+PostHog event.
+
+## Daily client usage and local runtime state
+
+`client_usage_daily` is the operational source of truth for Web/Desktop usage
+and Desktop built-in-provider conversion. Its primary key is
+`(user_id, client_type, install_id, activity_date)`, where `activity_date` is
+derived by the server in UTC. `install_id` is a random UUID stored in the Web
+origin or Electron app profile and reused across restarts, upgrades, logout,
+and login. Clearing/resetting that profile intentionally creates a new
+installation. Web and Desktop never share an installation ID.
+
+Clients report after authentication when that installation has no successful
+report for the current UTC day, and re-check on focus/resume. Desktop updates
+the same daily row after its first local-runtime probe and whenever the
+same-day runtime signature changes. Reports contain only client kind/version,
+a coarse OS bucket, optional current workspace context, and aggregate runtime
+provider/online/offline counts. The server supplies user, date, and timestamps.
+Device names, hostnames, local usernames, filesystem paths, raw user agents,
+IP addresses, and raw probe errors are not stored here.
+
+`first_active_at` and `last_active_at` are the first and latest successful
+reports **within that UTC day**, not lifetime installation timestamps. Compute
+historical first use with `min(first_active_at)` across the installation's daily
+rows. The client's UTC day is only a best-effort request throttle; the server's
+UTC date is authoritative, so clock skew near midnight can delay the next row
+until a later focus/resume without assigning activity to the wrong server day.
+
+Desktop runtime availability is deliberately a daemon-level approximation in
+this MVP, not a connection test for each provider. The probe counts locally
+detected **built-in provider CLIs**; workspace custom runtime profiles are not
+included. Consequently, treat `runtime_count = 0` as "no built-in provider CLI
+detected", not proof that the user has no custom profile. If the managed daemon
+is running, all detected built-in providers are reported online, and otherwise
+they are reported offline. Use `probe_result = 'error'` as unknown rather than
+treating a failed probe as zero runtimes. Covering custom profiles requires a
+separate inventory contract that remains available after the daemon stops; do
+not infer it from this snapshot.
+
+Use this query for a 30-day client split and user-level Desktop built-in-provider
+state. It first selects the latest non-null probe for each installation, then
+rolls installations up to the user so multi-device users are not double counted
+and missing probes remain `unknown` rather than being classified as having no
+built-in runtime:
+
+```sql
+WITH window_rows AS (
+    SELECT *
+    FROM client_usage_daily
+    WHERE activity_date >= (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::date - 29
+),
+active_clients AS (
+    SELECT DISTINCT user_id, client_type, install_id FROM window_rows
+),
+latest_desktop_probe AS (
+    SELECT DISTINCT ON (user_id, install_id)
+        user_id, install_id, probe_result, runtime_count, online_count
+    FROM window_rows
+    WHERE client_type = 'desktop' AND probe_result IS NOT NULL
+    ORDER BY user_id, install_id, activity_date DESC, runtime_probed_at DESC
+),
+desktop_by_user AS (
+    SELECT
+        a.user_id,
+        count(*) AS installation_count,
+        count(*) FILTER (WHERE p.probe_result = 'success') AS successful_probe_count,
+        coalesce(sum(p.runtime_count) FILTER (WHERE p.probe_result = 'success'), 0) AS runtime_count,
+        coalesce(sum(p.online_count) FILTER (WHERE p.probe_result = 'success'), 0) AS online_count
+    FROM active_clients a
+    LEFT JOIN latest_desktop_probe p USING (user_id, install_id)
+    WHERE a.client_type = 'desktop'
+    GROUP BY a.user_id
+),
+desktop_state AS (
+    SELECT user_id,
+        CASE
+            WHEN successful_probe_count < installation_count THEN 'unknown'
+            WHEN runtime_count = 0 THEN 'no_builtin_runtime'
+            WHEN online_count = 0 THEN 'all_builtin_runtimes_offline'
+            ELSE 'builtin_runtime_available'
+        END AS runtime_state
+    FROM desktop_by_user
+)
+SELECT
+    (SELECT count(DISTINCT user_id) FROM active_clients WHERE client_type = 'web') AS active_web_users,
+    (SELECT count(DISTINCT user_id) FROM active_clients WHERE client_type = 'desktop') AS active_desktop_users,
+    count(*) FILTER (WHERE runtime_state = 'builtin_runtime_available')
+        AS desktop_users_with_builtin_runtime,
+    count(*) FILTER (WHERE runtime_state = 'no_builtin_runtime')
+        AS desktop_users_without_builtin_runtime,
+    round(100.0 * count(*) FILTER (WHERE runtime_state = 'no_builtin_runtime')
+        / nullif((SELECT count(DISTINCT user_id) FROM active_clients WHERE client_type = 'desktop'), 0), 2)
+        AS desktop_users_without_builtin_runtime_pct,
+    count(*) FILTER (WHERE runtime_state = 'all_builtin_runtimes_offline')
+        AS desktop_users_all_builtin_runtimes_offline,
+    round(100.0 * count(*) FILTER (WHERE runtime_state = 'all_builtin_runtimes_offline')
+        / nullif((SELECT count(DISTINCT user_id) FROM active_clients WHERE client_type = 'desktop'), 0), 2)
+        AS desktop_users_all_builtin_runtimes_offline_pct,
+    count(*) FILTER (WHERE runtime_state = 'unknown') AS desktop_users_unknown
+FROM desktop_state;
+```
+
+The initial retention policy is 180 UTC days. This MVP deliberately does not
+add another in-process background job; operators should run
+`DELETE FROM client_usage_daily WHERE activity_date < (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::date - 179`
+through the existing database-maintenance schedule until a shared retention
+worker exists. Deleting a workspace nulls its optional context, while deleting
+a user must delete that user's daily rows in the same application transaction
+because this table has no foreign keys by repository policy. There is currently
+no production account hard-delete path; any future one must add that explicit
+cleanup before it deletes the user row.
 
 ## Governance
 

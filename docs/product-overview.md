@@ -82,7 +82,7 @@ Multica 做的事：
 
 Multica **不自己训模型**，也不锁定某一家厂商。它是调度器，本地 daemon 会自动探测以下 CLI 工具并接入：
 
-Claude Code · Codex · OpenClaw · OpenCode · Hermes · Gemini · Pi · Cursor Agent · Kimi · Kiro CLI
+Claude Code · Codex · OpenClaw · OpenCode · Hermes · Gemini · Pi · Cursor Agent · Kimi · Kiro CLI · Qoder CLI
 
 每个 agent 可以配置自己的模型、API Key、环境变量、MCP 服务器。
 
@@ -244,7 +244,7 @@ Project 相比 Issue 是更高层的组织单元。一个 issue 可以不属于�
 #### 配置字段
 
 - **基本信息**：名字、描述、头像（自动生成）
-- **Provider**：选择底层是 Claude / Codex / OpenClaw / OpenCode / Hermes / Gemini / Pi / Cursor / Kimi / Kiro 中的哪一个
+- **Provider**：选择底层是 Claude / Codex / OpenClaw / OpenCode / Hermes / Gemini / Pi / Cursor / Kimi / Kiro / Qoder 中的哪一个
 - **Runtime**：绑定到哪个运行时（即在哪台机器上跑）
 - **Instructions 说明书**：agent 的系统提示词（"你是一个资深工程师..."）
 - **Custom Env**：要注入到 CLI 进程的环境变量（如 `ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL`、`CLAUDE_CODE_USE_BEDROCK`）
@@ -291,7 +291,7 @@ Agent 是 Multica 的灵魂。几乎所有功能都围绕"如何让一个 agent 
 
 `multica` CLI 在用户的机器上启动一个后台进程（macOS launchd / Linux systemd / Windows 服务风格），它：
 
-1. **自动探测** `$PATH` 上安装的 coding CLI（`claude`, `codex`, `opencode`, `openclaw`, `hermes`, `gemini`, `pi`, `cursor-agent`, `kimi`, `kiro-cli`）
+1. **自动探测** `$PATH` 上安装的 coding CLI（`claude`, `codex`, `opencode`, `openclaw`, `hermes`, `pi`, `cursor-agent`, `kimi`, `kiro-cli`, `qodercli`, `qoderclicn`, `traecli`, `grok`）
 2. 向 server **注册** 为一组 runtime（一个 CLI = 一个 runtime）
 3. 每 3 秒 **轮询** 一次 server，有任务就认领
 4. 每 15 秒 **心跳**（keepalive），报告自己还活着

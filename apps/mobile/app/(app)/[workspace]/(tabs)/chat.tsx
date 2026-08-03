@@ -79,7 +79,9 @@ import { ChatComposer } from "@/components/chat/chat-composer";
 import { AgentPickerSheet } from "@/components/chat/agent-picker-sheet";
 import { NoAgentBanner } from "@/components/chat/no-agent-banner";
 import { OfflineBanner } from "@/components/chat/offline-banner";
+import { RuntimeRequiredBanner } from "@/components/chat/runtime-required-banner";
 import { useChatSelectStore } from "@/data/chat-select-store";
+import { isAgentRuntimeBound } from "@/lib/is-agent-runtime-bound";
 
 export default function ChatTab() {
   const qc = useQueryClient();
@@ -176,6 +178,8 @@ export default function ChatTab() {
   const presenceAvailability =
     presenceDetail === "loading" ? undefined : presenceDetail.availability;
   const isArchived = activeSession?.status === "archived";
+  const runtimeBound =
+    currentAgent !== null && isAgentRuntimeBound(currentAgent);
   const sending = !!pendingTask?.task_id;
 
   // ── Drafts ─────────────────────────────────────────────────────────────
@@ -239,8 +243,19 @@ export default function ChatTab() {
   );
 
   const handleSend = useCallback(
-    async (content: string, attachmentIds: string[] = []) => {
+    async (
+      content: string,
+      attachmentIds: string[] = [],
+      options: { clearDraft?: boolean } = {},
+    ) => {
       if (!currentAgent) return;
+      if (!runtimeBound) {
+        Alert.alert(
+          "Runtime required",
+          "Bind a runtime to this agent on web or desktop before sending a message.",
+        );
+        return;
+      }
 
       const isNewSession = !activeSessionId;
       const sessionId = await ensureSession(content);
@@ -278,7 +293,9 @@ export default function ChatTab() {
           created_at: result.created_at,
         });
         qc.invalidateQueries({ queryKey: chatKeys.messages(sessionId) });
-        clearDraft(sessionId);
+        if (options.clearDraft !== false) {
+          clearDraft(sessionId);
+        }
       } catch (err) {
         qc.setQueryData<ChatMessage[]>(chatKeys.messages(sessionId), (old) =>
           old ? old.filter((m) => m.id !== optimistic.id) : old,
@@ -290,6 +307,7 @@ export default function ChatTab() {
     [
       activeSessionId,
       currentAgent,
+      runtimeBound,
       ensureSession,
       qc,
       promoteNewDraft,
@@ -353,13 +371,18 @@ export default function ChatTab() {
 
   // ── Composer disabled-state ────────────────────────────────────────────
   const disabled =
-    !currentAgent || availability === "none" || isArchived === true;
+    !currentAgent ||
+    availability === "none" ||
+    isArchived === true ||
+    !runtimeBound;
   const disabledReason = !currentAgent
     ? "No agent selected"
     : availability === "none"
       ? "No agents in this workspace"
       : isArchived
         ? "This chat is archived"
+        : !runtimeBound
+          ? "Agent needs a runtime"
         : undefined;
 
   return (
@@ -397,14 +420,22 @@ export default function ChatTab() {
           hasSessions={sessions.length > 0}
           agentName={currentAgent?.name}
           onPickPrompt={(text) => setDraft(draftKey, text)}
+          onQuickAction={(action) =>
+            handleSend(action.prompt, [], { clearDraft: false })
+          }
+          quickActionsDisabled={sending || disabled}
           pendingTask={pendingTask}
           liveTaskMessages={liveTaskMessages}
           availability={presenceAvailability}
         />
-        <OfflineBanner
-          agentName={currentAgent?.name}
-          availability={presenceAvailability}
-        />
+        {runtimeBound ? (
+          <OfflineBanner
+            agentName={currentAgent?.name}
+            availability={presenceAvailability}
+          />
+        ) : currentAgent ? (
+          <RuntimeRequiredBanner agentName={currentAgent.name} />
+        ) : null}
         <ChatComposer
           value={draft}
           onChangeText={(next) => setDraft(draftKey, next)}

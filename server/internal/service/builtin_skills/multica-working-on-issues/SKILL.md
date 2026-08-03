@@ -1,6 +1,6 @@
 ---
 name: multica-working-on-issues
-description: "Use when working on a Multica issue after the runtime has provided the trigger context — to apply the product contracts the runtime brief does not encode: how PR linking differs from close intent, how to read a linked PR's real state via the pull-requests CLI, which metadata keys are high-signal, what status changes trigger on the server, and how sub-issue create status (todo vs backlog) controls whether assigned agents start immediately."
+description: "Use when acting on a Multica issue beyond what the brief covers: PR linking vs close intent, reading a linked PR's real state, metadata keys, status-change side effects, sub-issue todo vs backlog."
 user-invocable: false
 allowed-tools: Bash(multica *), Bash(git *), Bash(gh *)
 ---
@@ -23,11 +23,13 @@ same gate and they read different fields.
 
 **Linking** scans the PR **title, body, OR branch** for a routable issue key
 (`PREFIX-NUMBER`, e.g. `MUL-2759`). Each match writes an issue ↔ PR link row.
-This is the link that `multica issue pull-requests` reads back.
+This is the link that `multica issue pull-requests` reads back — but see the
+reference-only rule below: a key that appears **only** as a bare mention in the
+body is linked yet hidden from that list.
 
 ```text
-MUL-2759: add built-in issue working skill        # title prefix → links
-agent/matt/mul-2759-working-on-issues             # branch ref   → links
+MUL-2759: add built-in issue working skill        # title prefix → links, shown
+agent/matt/mul-2759-working-on-issues             # branch ref   → links, shown
 ```
 
 **Close intent** is stricter and is a separate scan over **title or body only —
@@ -47,6 +49,20 @@ Consequence: a bare title prefix or a branch reference links the PR but does not
 close the issue on merge. A closing keyword immediately adjacent to the issue key
 records close intent; on merge, that close intent can move the linked issue to
 `done`.
+
+**Reference-only links (hidden from the PR list).** A key that appears **only**
+as a bare mention in the body — no closing keyword, and not in the title or
+branch — still writes a link row, but the row is flagged `reference_only` and
+**excluded from `multica issue pull-requests`** (and the issue's right-side PR
+list in the UI). This keeps passing mentions like `Related MUL-2759` or
+`Follow up in MUL-2759` from surfacing an unrelated PR as if it were working on
+that issue. To make a PR show up for an issue, put the key in the title, the
+branch, or after a closing keyword in the body — not as a loose body reference.
+
+```text
+Closes MUL-2759 in the body                        # links and shown
+Related to MUL-2759 in the body (no title/branch)  # links but reference_only → hidden
+```
 
 ### Default for code-changing issue work
 
@@ -88,17 +104,28 @@ Returns `{"pull_requests": [...]}`. Each element exposes:
   response; the server folds them into `state` (merged wins, then closed, then
   draft, else open).
 - `merged_at` — non-null once merged; a second confirmation of `state: merged`.
+- `provider` — `github`, `forgejo`, `gitea`, or `gitlab`.
 - `mergeable_state` — mirrors GitHub (`clean` / `dirty` surfaced; other values
-  round-trip as unknown).
-- `checks_conclusion` — aggregated CI: `passed`, `failed`, `pending`, or `null`
-  when no check suite has been observed. Backed by `checks_passed`,
-  `checks_failed`, `checks_pending` counts.
+  round-trip as unknown; retained for compatibility).
+- GitHub API snapshot fields: `snapshot_available`, `mergeable`,
+  `merge_state_status`, `checks_rollup`, `checks_total`, `checks_passed`,
+  `checks_failed`, `checks_running`, `failed_check_names`,
+  `snapshot_fetched_at`, and `snapshot_stale`. `snapshot_available == true`
+  means the feature is enabled and the snapshot matches the PR's current head.
+  Only then does `checks_rollup == null` mean "no checks"; false means the
+  snapshot feature is disabled, has not fetched yet, or only has an old head.
+- `checks_conclusion` — coarse CI compatibility status: `passed`, `failed`,
+  `pending`, or `null`. GitHub derives it from the current API snapshot;
+  Forgejo/Gitea/GitLab derive it from webhook commit statuses. Backed by the
+  provider-appropriate check counts.
 
 So "is it merged?" is `state == "merged"` (or `merged_at != null`); "is it still
-a draft?" is `state == "draft"`; CI status is `checks_conclusion`.
+a draft?" is `state == "draft"`; coarse CI status is `checks_conclusion`.
 
 If the command returns no linked PRs after a PR was opened, the link scanner did
-not observe a routable issue key in the PR title/body/branch.
+not observe a routable issue key in the PR title/body/branch — or the only match
+was a bare body mention, which links as `reference_only` and is hidden from this
+list (see the reference-only rule above).
 
 ## Metadata: high-signal keys only
 
@@ -128,6 +155,32 @@ multica issue metadata delete <issue-id> --key <stale-key>
 `--value` is JSON-parsed by default (bool/number are sniffed); pass `--type
 string|number|bool` to force a type.
 
+## Custom properties: typed workflow state
+
+Workspaces may define custom issue properties (Severity, Environment, QA
+Status, ...). Properties are the typed, user-visible sibling of metadata:
+values are validated against the definition (select options, date format,
+http(s) URL), visible in the issue sidebar, and addressed by name.
+
+- Read what exists before writing: `multica property list` shows the catalog;
+  `multica issue property list <issue-id>` shows values set on the issue.
+- Set values by property name and option name — the CLI translates to ids:
+
+```bash
+multica issue property set <issue-id> --name Environment --value staging
+multica issue property set <issue-id> --name Platforms --value "iOS,Android"
+multica issue property unset <issue-id> --name Environment
+```
+
+- A validation error lists the legal options — fix the value and retry.
+- Definitions may include an optional catalog icon for visual identification;
+  it does not change the property's type or value validation.
+- Agents cannot create or edit property definitions (owner/admin humans only).
+  If a needed property does not exist, propose it in a comment instead.
+- Property vs metadata: if the value is workflow state a human should see and
+  filter by, and a definition exists, prefer the property. Metadata stays the
+  free-form scratchpad for run state (`pr_url`, `waiting_on`, ...).
+
 ## Status changes have server side effects
 
 A status change is not cosmetic — the server enqueues or skips agent work based
@@ -136,12 +189,25 @@ on it. These are the contracts, not advice:
 - **`backlog`** parks an agent-assigned issue: the assignee is set but no task
   fires. Moving `backlog → todo` (or any non-done/non-cancelled status) enqueues
   the assigned agent then.
+- **`in_progress` / `in_review` on assignment runs** are agent-managed CLI
+  mutations, not `StartTask` / `CompleteTask` side effects. The assignment
+  runtime brief asks ordinary agents for `todo`/`backlog` → `in_progress` then
+  `in_review` when they have delivered. Squad leaders share the opening
+  `in_progress` step on the first assignment turn, keep the parent there while
+  members work, and only move to `in_review` when a later re-trigger confirms
+  the overall goal is met.
 - **`in_review`** is an accepted issue status. Some workflows use it while a PR
   is open and awaiting review; moving to it is an explicit mutation.
 - **`done`** on a child issue posts a system comment on its parent. If a PR
   carries close intent (`Closes MUL-XXXX`), it advances the issue to `done`
   itself on merge — you do not also need to flip it manually.
-- **`cancelled`** stops outstanding work; treat it as a user-driven decision.
+- **`cancelled`** is a terminal, user-driven decision to close the issue. Like
+  `done` it enqueues no new agent work, but it does **not** stop tasks already in
+  flight — a run in progress keeps going (MUL-4465). To stop a running task,
+  cancel the task itself.
+- **Failed issue-triggered tasks** may roll an issue from `in_progress` back to
+  `todo` when no active task / retry remains — that is the main server-owned
+  status write on the agent-run path.
 
 ## Sub-issues: `todo` starts work now, `backlog` parks it
 
@@ -164,6 +230,40 @@ multica issue status <child-id> todo   # promote when the previous step is truly
 
 Creating every serial step as `todo` enqueues the whole chain at once.
 
+### Stages: order sub-issues into barrier groups
+
+`--stage <N>` (N ≥ 1) groups sub-issues under the same parent into ordered
+stages. The parent assignee is woken **once, when a whole stage finishes** —
+i.e. every sub-issue in the lowest unfinished stage has reached a terminal
+status (`done`/`cancelled`). A completion that does not close a stage is silent
+(no comment, no wake). A sibling set with **no** stages is one implicit stage,
+so the parent is woken once when the *last* sub-issue finishes — not on every
+child.
+
+Advancement is agent-driven: the server only detects the closed barrier and
+wakes the parent assignee, who then decides whether to promote the next stage's
+`backlog` sub-issues to `todo`.
+
+```bash
+# Stage 1 runs now; later stages parked until promoted
+multica issue create --title "Research A" --parent <id> --assignee <agent> --stage 1 --status todo
+multica issue create --title "Research B" --parent <id> --assignee <agent> --stage 1 --status todo
+multica issue create --title "Build"      --parent <id> --assignee <agent> --stage 2 --status backlog
+multica issue create --title "Ship"       --parent <id> --assignee <agent> --stage 3 --status backlog
+```
+
+When both Stage 1 sub-issues finish you (the parent assignee) are woken with a
+"Stage 1 complete" comment. Inspect the layout, then promote the next stage:
+
+```bash
+multica issue children <parent-id>             # sub-issues grouped by stage
+multica issue status <stage-2-child-id> todo   # promote when its deps are met
+```
+
+Read each sub-issue's description before promoting and only promote items whose
+stated dependencies are met; if a description conflicts with the parent's
+breakdown, leave it `backlog` and comment to confirm first.
+
 ## Incorrect → correct
 
 PR title (link the issue):
@@ -173,16 +273,18 @@ Fix login redirect                  # incorrect — no issue key, won't link
 MUL-2759: fix login redirect        # correct — links the PR
 ```
 
-Serial sub-issues (don't start the whole chain):
+Serial / phased sub-issues (don't start the whole chain at once):
 
 ```bash
-# incorrect — both fire immediately
+# incorrect — all fire immediately, no ordering
 multica issue create --title "Step 2" --parent <issue-id> --assignee <agent> --status todo
 multica issue create --title "Step 3" --parent <issue-id> --assignee <agent> --status todo
 
-# correct — parked, promote in turn
-multica issue create --title "Step 2" --parent <issue-id> --assignee <agent> --status backlog
-multica issue create --title "Step 3" --parent <issue-id> --assignee <agent> --status backlog
+# correct — stage them; Stage 1 runs, later stages park and are promoted as
+# each stage's barrier closes
+multica issue create --title "Step 1" --parent <issue-id> --assignee <agent> --stage 1 --status todo
+multica issue create --title "Step 2" --parent <issue-id> --assignee <agent> --stage 2 --status backlog
+multica issue create --title "Step 3" --parent <issue-id> --assignee <agent> --stage 3 --status backlog
 ```
 
 ## References
@@ -191,4 +293,6 @@ multica issue create --title "Step 3" --parent <issue-id> --assignee <agent> --s
 contract above: the `pull-requests` CLI and route, the PR response field list,
 `derivePRState`, the two-path link (`extractIdentifiers`) vs close-intent
 (`extractClosingIdentifiers`) proof, the backlog enqueue lines, child-done
-notify, and the metadata CLI. Re-derive before depending on an exact line.
+notify, the stage column / `stageBarrierClosed` barrier and the `--stage` /
+`issue children` CLI, and the metadata CLI. Re-derive before depending on an
+exact line.

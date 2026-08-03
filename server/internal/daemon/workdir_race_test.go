@@ -2,13 +2,16 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -95,9 +98,9 @@ func TestRunTask_StartTaskCalledAfterWorkdirOnDisk(t *testing.T) {
 	expectedWorkDir := filepath.Join(expectedEnvRoot, "workdir")
 
 	var (
-		startCalled    atomic.Bool
-		workdirOnDisk  atomic.Bool
-		envRootOnDisk  atomic.Bool
+		startCalled   atomic.Bool
+		workdirOnDisk atomic.Bool
+		envRootOnDisk atomic.Bool
 	)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -156,6 +159,300 @@ func TestRunTask_StartTaskCalledAfterWorkdirOnDisk(t *testing.T) {
 	}
 }
 
+func TestRunTask_InjectsPrivateTaskTempDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script agent fixture is POSIX-only")
+	}
+
+	workspacesRoot := filepath.Join(t.TempDir(), strings.Repeat("long-workspaces-root-", 3))
+	workspaceID := "ws-private-temp"
+	taskID := "task-private-temp-with-long-id-that-would-overflow-socket-paths"
+	envRoot := execenv.PredictRootDir(workspacesRoot, workspaceID, taskID)
+
+	captureFile := filepath.Join(t.TempDir(), "agent-env.txt")
+	fakeBin := filepath.Join(t.TempDir(), "claude")
+	script := `#!/bin/sh
+if [ -d "$TMPDIR" ]; then
+  tmpdir_exists=yes
+else
+  tmpdir_exists=no
+fi
+printf 'TMPDIR=%s\nTMP=%s\nTEMP=%s\nTMPDIR_EXISTS=%s\n' "$TMPDIR" "$TMP" "$TEMP" "$tmpdir_exists" > "$CAPTURE_FILE"
+IFS= read -r _
+printf '%s\n' '{"type":"system","session_id":"sess-private-temp"}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-private-temp","result":"done"}'
+`
+	if err := os.WriteFile(fakeBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake agent: %v", err)
+	}
+	if err := os.Chmod(fakeBin, 0o755); err != nil {
+		t.Fatalf("chmod fake agent: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	d := &Daemon{
+		client:         NewClient(srv.URL),
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		workspaces:     make(map[string]*workspaceState),
+		runtimeIndex:   map[string]Runtime{"rt-1": {ID: "rt-1", Provider: "claude"}},
+		activeEnvRoots: make(map[string]int),
+		cfg: Config{
+			WorkspacesRoot: workspacesRoot,
+			AgentTimeout:   5 * time.Second,
+			ServerBaseURL:  srv.URL,
+			Agents: map[string]AgentEntry{
+				"claude": {Path: fakeBin, Model: ""},
+			},
+		},
+	}
+
+	task := Task{
+		ID:          taskID,
+		WorkspaceID: workspaceID,
+		RuntimeID:   "rt-1",
+		IssueID:     "issue-private-temp",
+		AuthToken:   "mat_private_temp",
+		Agent: &AgentData{
+			ID:   "agent-private-temp",
+			Name: "test-agent",
+			CustomEnv: map[string]string{
+				"CAPTURE_FILE": captureFile,
+				"TMPDIR":       "/shared/tmp",
+				"TMP":          "/shared/tmp",
+				"TEMP":         "/shared/tmp",
+			},
+		},
+	}
+
+	taskLog := slog.New(slog.NewTextHandler(io.Discard, nil))
+	result, err := d.runTask(context.Background(), task, "claude", 0, taskLog)
+	if err != nil {
+		t.Fatalf("runTask(): %v", err)
+	}
+	if result.Status != "completed" {
+		t.Fatalf("runTask status = %q, want completed (comment=%q)", result.Status, result.Comment)
+	}
+
+	raw, err := os.ReadFile(captureFile)
+	if err != nil {
+		t.Fatalf("read captured agent env: %v", err)
+	}
+	got := make(map[string]string)
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			t.Fatalf("malformed captured env line %q", line)
+		}
+		got[key] = value
+	}
+	for _, key := range []string{"TMPDIR", "TMP", "TEMP"} {
+		if got[key] == "" {
+			t.Fatalf("%s was not captured", key)
+		}
+		if got[key] != got["TMPDIR"] {
+			t.Fatalf("%s = %q, want same private task temp dir %q", key, got[key], got["TMPDIR"])
+		}
+	}
+	if got["TMPDIR_EXISTS"] != "yes" {
+		t.Fatalf("fake agent saw TMPDIR_EXISTS=%q, want yes", got["TMPDIR_EXISTS"])
+	}
+	taskTempDir := got["TMPDIR"]
+	if strings.HasPrefix(taskTempDir, envRoot) {
+		t.Fatalf("task temp dir %q must not live under long env root %q", taskTempDir, envRoot)
+	}
+	if len(taskTempDir) > 80 {
+		t.Fatalf("task temp dir %q length = %d, want <= 80 for Unix-socket headroom", taskTempDir, len(taskTempDir))
+	}
+	if _, err := os.Stat(taskTempDir); !os.IsNotExist(err) {
+		t.Fatalf("expected task temp dir %q to be cleaned after run, stat err=%v", taskTempDir, err)
+	}
+}
+
+func TestRunTask_ExtendsPrepareLeaseDuringStartTask(t *testing.T) {
+	oldRefresh := taskPrepareLeaseRefresh
+	oldTimeout := taskPrepareLeaseTimeout
+	taskPrepareLeaseRefresh = 10 * time.Millisecond
+	taskPrepareLeaseTimeout = 500 * time.Millisecond
+	t.Cleanup(func() {
+		taskPrepareLeaseRefresh = oldRefresh
+		taskPrepareLeaseTimeout = oldTimeout
+	})
+
+	workspacesRoot := t.TempDir()
+	workspaceID := "ws-runtask-start-lease"
+	taskID := "task-runtask-start-lease"
+	var (
+		startEntered     atomic.Bool
+		leaseDuringStart atomic.Bool
+		closeLeaseOnce   sync.Once
+	)
+	leaseSeenDuringStart := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/prepare-lease"):
+			if startEntered.Load() {
+				leaseDuringStart.Store(true)
+				closeLeaseOnce.Do(func() { close(leaseSeenDuringStart) })
+			}
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/start"):
+			startEntered.Store(true)
+			select {
+			case <-leaseSeenDuringStart:
+			case <-time.After(2 * time.Second):
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	missingBin := filepath.Join(t.TempDir(), "definitely-not-claude")
+	d := &Daemon{
+		client:         NewClient(srv.URL),
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		workspaces:     make(map[string]*workspaceState),
+		runtimeIndex:   map[string]Runtime{"rt-1": {ID: "rt-1", Provider: "claude"}},
+		activeEnvRoots: make(map[string]int),
+		cfg: Config{
+			WorkspacesRoot: workspacesRoot,
+			Agents: map[string]AgentEntry{
+				"claude": {Path: missingBin, Model: ""},
+			},
+		},
+	}
+
+	task := Task{
+		ID:          taskID,
+		WorkspaceID: workspaceID,
+		RuntimeID:   "rt-1",
+		IssueID:     "issue-runtask-start-lease",
+		Agent:       &AgentData{Name: "test-agent"},
+	}
+
+	taskLog := slog.New(slog.NewTextHandler(io.Discard, nil))
+	_, _ = d.runTask(context.Background(), task, "claude", 0, taskLog)
+
+	if !startEntered.Load() {
+		t.Fatal("runTask did not call /start")
+	}
+	if !leaseDuringStart.Load() {
+		t.Fatal("prepare lease was not extended while /start was still in flight")
+	}
+}
+
+type prepareLeaseCountingTransport struct {
+	base  http.RoundTripper
+	calls *atomic.Int64
+}
+
+func (t *prepareLeaseCountingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if strings.HasSuffix(req.URL.Path, "/prepare-lease") {
+		t.calls.Add(1)
+	}
+	return t.base.RoundTrip(req)
+}
+
+func TestRunTask_PrepareTimeoutStopsLeaseDuringBlockedStartTask(t *testing.T) {
+	oldRefresh := taskPrepareLeaseRefresh
+	oldTimeout := taskPrepareLeaseTimeout
+	taskPrepareLeaseRefresh = 10 * time.Millisecond
+	taskPrepareLeaseTimeout = 500 * time.Millisecond
+	t.Cleanup(func() {
+		taskPrepareLeaseRefresh = oldRefresh
+		taskPrepareLeaseTimeout = oldTimeout
+	})
+
+	var leaseCalls atomic.Int64
+	startEntered := make(chan struct{})
+	var closeStartOnce sync.Once
+	releaseStart := make(chan struct{})
+	var releaseStartOnce sync.Once
+	t.Cleanup(func() { releaseStartOnce.Do(func() { close(releaseStart) }) })
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/prepare-lease"):
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/start"):
+			closeStartOnce.Do(func() { close(startEntered) })
+			<-releaseStart
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	// Count requests where the extender starts them. A cancelled RoundTrip can
+	// return before httptest schedules its handler, so counting in the handler
+	// can make an already-in-flight request look like post-timeout activity.
+	client := NewClient(srv.URL)
+	client.client.Transport = &prepareLeaseCountingTransport{
+		base:  client.client.Transport,
+		calls: &leaseCalls,
+	}
+
+	workspacesRoot := t.TempDir()
+	fakeBin := filepath.Join(t.TempDir(), "claude")
+	if err := os.WriteFile(fakeBin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write fake agent: %v", err)
+	}
+	d := &Daemon{
+		client:             client,
+		logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		workspaces:         make(map[string]*workspaceState),
+		runtimeIndex:       map[string]Runtime{"rt-1": {ID: "rt-1", Provider: "claude"}},
+		activeEnvRoots:     make(map[string]int),
+		taskPrepareTimeout: 150 * time.Millisecond,
+		cfg: Config{
+			WorkspacesRoot: workspacesRoot,
+			Agents: map[string]AgentEntry{
+				"claude": {Path: fakeBin},
+			},
+		},
+	}
+
+	task := Task{
+		ID:          "task-runtask-start-timeout",
+		WorkspaceID: "ws-runtask-start-timeout",
+		RuntimeID:   "rt-1",
+		IssueID:     "issue-runtask-start-timeout",
+		Agent:       &AgentData{Name: "test-agent"},
+	}
+	taskLog := slog.New(slog.NewTextHandler(io.Discard, nil))
+	startedAt := time.Now()
+	_, err := d.runTask(context.Background(), task, "claude", 0, taskLog)
+	if !errors.Is(err, errTaskPrepareTimeout) {
+		t.Fatalf("runTask error = %v, want task prepare timeout", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed > time.Second {
+		t.Fatalf("runTask took %s, want prepare deadline to stop blocked /start", elapsed)
+	}
+	select {
+	case <-startEntered:
+	default:
+		t.Fatal("runTask did not reach /start")
+	}
+	releaseStartOnce.Do(func() { close(releaseStart) })
+	if got := leaseCalls.Load(); got == 0 {
+		t.Fatal("prepare lease request was never started while /start was blocked")
+	}
+	leaseCallsAtReturn := leaseCalls.Load()
+	time.Sleep(4 * taskPrepareLeaseRefresh)
+	if got := leaseCalls.Load(); got != leaseCallsAtReturn {
+		t.Fatalf("prepare lease requests kept starting after timeout: calls %d -> %d", leaseCallsAtReturn, got)
+	}
+	if got := taskRunFailureReason(err); got != "timeout" {
+		t.Fatalf("taskRunFailureReason = %q, want retryable platform timeout", got)
+	}
+}
+
 // TestHandleTask_KeepsEnvRootActiveAcrossCompletion is the regression guard
 // for issue #3999 race B. After runner.run returns, the in-process active
 // guard installed inside runTask (defer unmarkActiveEnvRoot at the
@@ -178,7 +475,7 @@ func TestHandleTask_KeepsEnvRootActiveAcrossCompletion(t *testing.T) {
 	expectedEnvRoot := execenv.PredictRootDir(workspacesRoot, workspaceID, taskID)
 
 	var (
-		completeCalled atomic.Bool
+		completeCalled   atomic.Bool
 		activeAtComplete atomic.Bool
 	)
 

@@ -21,12 +21,14 @@ export interface TimelineEntry {
   parent_id?: string | null;
   updated_at?: string;
   comment_type?: string;
+  /** Set only on comments a quick action produced (MUL-5465). Unforgeable. */
+  quick_action_id?: string | null;
   reactions?: Reaction[];
   attachments?: Attachment[];
   resolved_at?: string | null;
   resolved_by_type?: CommentAuthorType | null;
   resolved_by_id?: string | null;
+  source_task_id?: string | null;
   /** Set by frontend coalescing when consecutive identical activities are merged. */
   coalesced_count?: number;
 }
-

@@ -24,8 +24,14 @@ const (
 	// files, not the always-loaded body.
 	maxSkillBodyLines = 500
 	// maxDescriptionChars is the frontmatter description cap — it is the only
-	// thing an agent sees when deciding whether to load the skill.
-	maxDescriptionChars = 1024
+	// thing an agent sees when deciding whether to load the skill, and every
+	// runtime CLI pays for it in the always-loaded skill listing. A description
+	// earns its characters two ways only: trigger wording that matches how the
+	// task actually arrives, and reverse boundaries that prevent mis-routing.
+	// A "Covers A, B, C..." content inventory does neither — the agent reads the
+	// body once it opens the skill. The cap is deliberately tight (the longest
+	// built-in sits at 222) so that inventory prose cannot creep back in.
+	maxDescriptionChars = 300
 )
 
 // TestBuiltinSkillsConformToTemplate enforces the standard-template invariants
@@ -335,6 +341,7 @@ func TestCreatingAgentsSkillCoversAgentCreationContracts(t *testing.T) {
 		"not a parameter manual",
 		"`description` is a catalog summary",
 		"`instructions` is the runtime behavior contract",
+		"`avatar_url` → a random `emoji:<glyph>`",
 		"multica agent create --name <name> --runtime-id <runtime-id>",
 		"`model` is a first-class persisted column",
 		"custom_env",
@@ -465,6 +472,7 @@ func TestRuntimesAndReposSkillCoversClaimAndCheckoutChain(t *testing.T) {
 		"multica runtime list --output json",
 		"multica repo checkout <url>",
 		"MULTICA_DAEMON_PORT",
+		"resource_ref.ref",
 		"github_repo",
 		"local_directory",
 		"Runtime and repo commands affect active agent execution",
@@ -499,9 +507,11 @@ func TestProjectsAndResourcesSkillCoversDurableContext(t *testing.T) {
 		".multica/project/resources.json",
 		"multica project resource list <project-id> --output json",
 		"multica project resource add <project-id> --type github_repo --url <github-url> --output json",
+		"multica project resource add <project-id> --type github_repo --url <github-url> --ref <branch-or-sha> --output json",
 		"multica project resource add <project-id> --type local_directory",
 		"Project resources are durable and affect future tasks",
 		"github_repo.resource_ref.url",
+		"resource_ref.ref",
 		"references/projects-and-resources-source-map.md",
 	}
 	for _, want := range mustContain {

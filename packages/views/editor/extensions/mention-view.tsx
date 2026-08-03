@@ -8,7 +8,7 @@
  * to open in a new tab (AppLink doesn't expose that intent hook).
  *
  * Issue chip sizing: must fit within the paragraph line box (14px * 1.625 =
- * 22.75px). Card is text-xs (12px) + py-0.5 + border ≈ 22px total. The
+ * 22.75px). Card is text-caption (12px) + py-0.5 + border ≈ 22px total. The
  * `vertical-align: middle` rule on `[data-node-view-wrapper]` in CSS handles
  * line-box alignment; setting it on the inner <a> has no effect because the
  * wrapper is the outermost inline element.
@@ -17,6 +17,7 @@
 import { NodeViewWrapper } from "@tiptap/react";
 import type { NodeViewProps } from "@tiptap/react";
 import { useWorkspacePaths } from "@multica/core/paths";
+import { useIssueLinkStore } from "@multica/core/issues/stores";
 import { useNavigation } from "../../navigation";
 import { IssueChip } from "../../issues/components/issue-chip";
 import { ProjectChip } from "../../projects/components/project-chip";
@@ -59,17 +60,23 @@ function ProjectMention({
   const projectPath = p.projectDetail(projectId);
 
   const handleClick = (e: React.MouseEvent) => {
-    e.preventDefault();
     e.stopPropagation();
     if (e.metaKey || e.ctrlKey || e.shiftKey) {
-      if (openInNewTab) openInNewTab(projectPath, fallbackLabel);
+      if (openInNewTab) {
+        e.preventDefault();
+        openInNewTab(projectPath, fallbackLabel);
+      }
+      // Web: no adapter — leave the event alone so the browser's native
+      // modifier-click on the anchor opens the tab (or window for shift),
+      // preserving background/foreground semantics window.open would flatten.
       return;
     }
+    e.preventDefault();
     push(projectPath);
   };
 
   return (
-    <a href={projectPath} onClick={handleClick} className="project-mention inline-flex">
+    <a href={projectPath} onClick={handleClick} className="project-mention">
       <ProjectChip
         projectId={projectId}
         fallbackLabel={fallbackLabel}
@@ -88,20 +95,39 @@ function IssueMention({
 }) {
   const p = useWorkspacePaths();
   const { push, openInNewTab } = useNavigation();
+  const newTabPreferred = useIssueLinkStore((s) => s.openInNewTab);
   const issuePath = p.issueDetail(issueId);
 
   const handleClick = (e: React.MouseEvent) => {
-    e.preventDefault();
     e.stopPropagation();
     if (e.metaKey || e.ctrlKey || e.shiftKey) {
-      if (openInNewTab) openInNewTab(issuePath, fallbackLabel);
+      if (openInNewTab) {
+        e.preventDefault();
+        openInNewTab(issuePath, fallbackLabel);
+      }
+      // Web: no adapter — native modifier-click on the anchor opens a tab.
       return;
     }
+    if (newTabPreferred) {
+      if (openInNewTab) {
+        e.preventDefault();
+        openInNewTab(issuePath, fallbackLabel, { activate: true });
+      }
+      // Web: native target="_blank" opens a browser tab.
+      return;
+    }
+    e.preventDefault();
     push(issuePath);
   };
 
   return (
-    <a href={issuePath} onClick={handleClick} className="issue-mention inline-flex">
+    <a
+      href={issuePath}
+      target={newTabPreferred ? "_blank" : undefined}
+      rel={newTabPreferred ? "noopener noreferrer" : undefined}
+      onClick={handleClick}
+      className="issue-mention"
+    >
       <IssueChip
         issueId={issueId}
         fallbackLabel={fallbackLabel}

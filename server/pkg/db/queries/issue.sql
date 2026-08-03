@@ -7,7 +7,7 @@
 -- "Assigned to me"), and the two filters must produce disjoint result sets.
 SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
        i.assignee_type, i.assignee_id, i.creator_type, i.creator_id,
-       i.parent_issue_id, i.position, i.start_date, i.due_date, i.created_at, i.updated_at, i.number, i.project_id, i.metadata
+       i.parent_issue_id, i.position, i.start_date, i.due_date, i.created_at, i.updated_at, i.number, i.project_id, i.metadata, i.stage, i.properties
 FROM issue i
 WHERE i.workspace_id = $1
   AND (sqlc.narg('status')::text IS NULL OR i.status = sqlc.narg('status'))
@@ -65,6 +65,17 @@ LIMIT $2 OFFSET $3;
 SELECT * FROM issue
 WHERE id = $1;
 
+-- name: GetIssueGCStatus :one
+SELECT workspace_id, status, updated_at
+FROM issue
+WHERE id = $1;
+
+-- name: ListIssueGCStatuses :many
+SELECT id, status, updated_at
+FROM issue
+WHERE workspace_id = sqlc.arg('workspace_id')
+  AND id = ANY(sqlc.arg('issue_ids')::uuid[]);
+
 -- name: GetIssueInWorkspace :one
 SELECT * FROM issue
 WHERE id = $1 AND workspace_id = $2;
@@ -73,9 +84,11 @@ WHERE id = $1 AND workspace_id = $2;
 INSERT INTO issue (
     workspace_id, title, description, status, priority,
     assignee_type, assignee_id, creator_type, creator_id,
-    parent_issue_id, position, start_date, due_date, number, project_id
+    parent_issue_id, position, start_date, due_date, number, project_id,
+    stage
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+    sqlc.narg('stage')
 ) RETURNING *;
 
 -- name: GetIssueByNumber :one
@@ -95,6 +108,7 @@ UPDATE issue SET
     due_date = sqlc.narg('due_date'),
     parent_issue_id = sqlc.narg('parent_issue_id'),
     project_id = sqlc.narg('project_id'),
+    stage = sqlc.narg('stage'),
     updated_at = now()
 WHERE id = $1
 RETURNING *;
@@ -112,10 +126,10 @@ INSERT INTO issue (
     workspace_id, title, description, status, priority,
     assignee_type, assignee_id, creator_type, creator_id,
     parent_issue_id, position, start_date, due_date, number, project_id,
-    origin_type, origin_id
+    origin_type, origin_id, stage
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-    sqlc.narg('origin_type'), sqlc.narg('origin_id')
+    sqlc.narg('origin_type'), sqlc.narg('origin_id'), sqlc.narg('stage')
 ) RETURNING *;
 
 -- name: LockIssueDuplicateKey :exec
@@ -131,20 +145,56 @@ WHERE workspace_id = $1
 ORDER BY created_at ASC
 LIMIT 1;
 
+-- name: FindRecentAutopilotDuplicateIssue :one
+SELECT i.* FROM issue i
+WHERE i.workspace_id = $1
+  AND i.status NOT IN ('done', 'cancelled')
+  AND i.origin_type = 'autopilot'
+  AND i.origin_id = $2
+  AND i.project_id IS NOT DISTINCT FROM sqlc.arg('project_id')::uuid
+  AND lower(btrim(regexp_replace(i.title, '[[:space:]]+', ' ', 'g'))) = sqlc.arg('normalized_title')
+  AND i.created_at >= sqlc.arg('created_after')::timestamptz
+  AND EXISTS (
+    SELECT 1
+    FROM autopilot_run r
+    WHERE r.issue_id = i.id
+      AND r.autopilot_id = i.origin_id
+      AND r.status IN ('issue_created', 'running', 'completed')
+  )
+ORDER BY i.created_at ASC
+LIMIT 1;
+
 -- name: DeleteIssue :exec
 -- Defense-in-depth: the workspace_id predicate makes the tenant invariant a
 -- SQL-layer guarantee rather than a handler-layer one. Handler loaders
 -- (loadIssueForUser / GetIssueInWorkspace) already enforce membership today,
 -- but a future loader bypass or a new caller skipping the loader would be
 -- silently catastrophic without this guard. See incident #1661.
-DELETE FROM issue WHERE id = $1 AND workspace_id = $2;
+--
+-- issue_vcs_pull_request (migration 213) has no FK to issue, so the link rows
+-- are not cascaded away. Sweep them here so they go atomically with the issue.
+-- The mirrored PR rows themselves belong to the connection, not the issue, so
+-- they persist (matching the GitHub link behaviour).
+--
+-- The sweep MUST route through the same workspace-checked target as the issue
+-- delete: deleting links by bare issue_id would drop another tenant's link rows
+-- when a caller passes a foreign issue_id with its own workspace_id (the issue
+-- itself is correctly untouched, but the links are already gone) — the exact
+-- cross-tenant leak the #1661 guard above exists to prevent.
+WITH target AS (
+    SELECT issue.id FROM issue WHERE issue.id = $1 AND issue.workspace_id = $2
+),
+cleared_vcs_pr_links AS (
+    DELETE FROM issue_vcs_pull_request WHERE issue_id IN (SELECT target.id FROM target)
+)
+DELETE FROM issue WHERE issue.id IN (SELECT target.id FROM target);
 
 -- name: ListOpenIssues :many
 -- See ListIssues for the semantics of involves_user_id (mirrors the 4-branch
 -- filter; member-direct assignment is intentionally excluded).
 SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
        i.assignee_type, i.assignee_id, i.creator_type, i.creator_id,
-       i.parent_issue_id, i.position, i.start_date, i.due_date, i.created_at, i.updated_at, i.number, i.project_id, i.metadata
+       i.parent_issue_id, i.position, i.start_date, i.due_date, i.created_at, i.updated_at, i.number, i.project_id, i.metadata, i.stage, i.properties
 FROM issue i
 WHERE i.workspace_id = $1
   AND i.status NOT IN ('done', 'cancelled')
@@ -154,6 +204,23 @@ WHERE i.workspace_id = $1
   AND (sqlc.narg('creator_id')::uuid IS NULL OR i.creator_id = sqlc.narg('creator_id'))
   AND (sqlc.narg('project_id')::uuid IS NULL OR i.project_id = sqlc.narg('project_id'))
   AND (sqlc.narg('metadata_filter')::jsonb IS NULL OR i.metadata @> sqlc.narg('metadata_filter')::jsonb)
+  -- properties_filter is a jsonb array of groups, each group an array of
+  -- containment patterns (built by parsePropertiesFilterParam): the issue
+  -- must match at least one pattern from EVERY group (AND of ORs). The
+  -- correlated form skips the GIN index, which is fine here: open_only is
+  -- an unpaginated workspace scan already narrowed by status.
+  AND (
+    sqlc.narg('properties_filter')::jsonb IS NULL
+    OR NOT EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements(sqlc.narg('properties_filter')::jsonb) AS pf(alternatives)
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(pf.alternatives) AS alt(pattern)
+        WHERE i.properties @> alt.pattern
+      )
+    )
+  )
   AND (
     sqlc.narg('involves_user_id')::uuid IS NULL
     OR (i.assignee_type = 'agent' AND i.assignee_id IN (
@@ -234,9 +301,15 @@ WHERE i.workspace_id = $1
   );
 
 -- name: ListChildIssues :many
+-- Order by number ASC so sub-issues display in stable creation order
+-- (oldest first), matching how a parent's plan reads top-to-bottom. The
+-- position column is computed per-(workspace, status) by NextTopPosition,
+-- not relative to siblings, so ordering by it interleaves children
+-- unpredictably across batches and statuses; number is a per-workspace
+-- monotonic counter and is sibling-stable.
 SELECT * FROM issue
 WHERE parent_issue_id = $1
-ORDER BY position ASC, created_at DESC;
+ORDER BY number ASC;
 
 -- name: ListChildrenByParents :many
 -- Batched variant of ListChildIssues: returns all children for the given
@@ -244,10 +317,12 @@ ORDER BY position ASC, created_at DESC;
 -- (one request per visible parent lane). Result is grouped client-side by
 -- parent_issue_id; the workspace filter is also enforced so callers can't
 -- enumerate children of parents in workspaces they don't belong to.
+-- Within each parent, order by number ASC for the same sibling-stable
+-- creation order as ListChildIssues.
 SELECT * FROM issue
 WHERE workspace_id = sqlc.arg('workspace_id')
   AND parent_issue_id = ANY(sqlc.arg('parent_ids')::uuid[])
-ORDER BY parent_issue_id, position ASC, created_at DESC;
+ORDER BY parent_issue_id, number ASC;
 
 -- name: GetIssueByOrigin :one
 -- Finds the issue stamped with a specific (origin_type, origin_id) pair.

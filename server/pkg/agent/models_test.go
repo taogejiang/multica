@@ -3,30 +3,46 @@ package agent
 import (
 	"context"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
 	"testing"
 )
 
-func TestListModelsStaticProviders(t *testing.T) {
-	ctx := context.Background()
-	for _, provider := range []string{"claude", "codex", "gemini", "cursor"} {
-		got, err := ListModels(ctx, provider, "")
-		if err != nil {
-			t.Fatalf("ListModels(%q) error: %v", provider, err)
+func TestStaticModelCatalogsHaveValidEntries(t *testing.T) {
+	t.Parallel()
+	catalogs := map[string][]Model{
+		"claude": claudeStaticModels(),
+		"codex":  codexStaticModels(),
+		"cursor": cursorStaticModels(),
+	}
+	for provider, models := range catalogs {
+		if len(models) == 0 {
+			t.Errorf("%s static catalog returned no models", provider)
 		}
-		if len(got) == 0 {
-			t.Errorf("ListModels(%q) returned no models", provider)
-		}
-		for i, m := range got {
-			if m.ID == "" {
-				t.Errorf("ListModels(%q)[%d] has empty ID", provider, i)
+		for i, model := range models {
+			if model.ID == "" {
+				t.Errorf("%s static catalog[%d] has empty ID", provider, i)
 			}
-			if m.Label == "" {
-				t.Errorf("ListModels(%q)[%d] has empty Label", provider, i)
+			if model.Label == "" {
+				t.Errorf("%s static catalog[%d] has empty Label", provider, i)
 			}
 		}
+	}
+}
+
+func TestListModelsQwenUsesRuntimeDefaultAndManualEntry(t *testing.T) {
+	// Qwen returns its manual-entry catalog without resolving or executing a CLI.
+	got, err := ListModels(context.Background(), "qwen", "")
+	if err != nil {
+		t.Fatalf("ListModels(qwen) error: %v", err)
+	}
+	if len(got.Models) != 0 {
+		t.Fatalf("ListModels(qwen) = %+v, want no account-specific static catalog", got)
+	}
+	if got.Fallback {
+		t.Error("qwen's empty catalog is deliberate, not a discovery fallback")
 	}
 }
 
@@ -41,15 +57,18 @@ func TestListModelsCopilotFallsBackToStatic(t *testing.T) {
 	delete(modelCache, "copilot")
 	modelCacheMu.Unlock()
 
-	got, err := ListModels(ctx, "copilot", "/nonexistent/copilot-cli")
+	got, err := ListModels(ctx, "copilot", missingAgentExecutable(t, "copilot"))
 	if err != nil {
 		t.Fatalf("ListModels(copilot) error: %v", err)
 	}
-	if len(got) == 0 {
+	if len(got.Models) == 0 {
 		t.Fatal("expected static fallback models, got empty list")
 	}
+	if !got.Fallback {
+		t.Error("a static stand-in must be marked Fallback so it is never cached as the real catalog")
+	}
 	ids := map[string]bool{}
-	for _, m := range got {
+	for _, m := range got.Models {
 		ids[m.ID] = true
 	}
 	if !ids["gpt-5.4"] || !ids["claude-sonnet-4.6"] {
@@ -80,60 +99,94 @@ func TestClaudeStaticModelsExposesFable5(t *testing.T) {
 	}
 }
 
-func TestGeminiStaticModelsExposesAliasesAndGemini3(t *testing.T) {
-	// Gemini CLI has no `models list` subcommand, so we expose the
-	// CLI's own aliases (auto / pro / flash / flash-lite) plus
-	// explicit version pins including Gemini 3. Regression guard
-	// for multica-ai/multica#1503 — Gemini 3 must be selectable.
-	models := geminiStaticModels()
+func TestClaudeStaticModelsExposesSonnet5(t *testing.T) {
+	models := claudeStaticModels()
 	ids := map[string]Model{}
+	defaults := 0
 	for _, m := range models {
 		ids[m.ID] = m
-	}
-	for _, want := range []string{
-		"auto", "auto-gemini-2.5",
-		"pro", "flash", "flash-lite",
-		"gemini-3-pro-preview", "gemini-3-flash-preview",
-		"gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite",
-	} {
-		if _, ok := ids[want]; !ok {
-			t.Errorf("missing expected Gemini model %q in: %+v", want, models)
+		if m.Default {
+			defaults++
 		}
 	}
-	auto, ok := ids["auto"]
-	if !ok || !auto.Default {
-		t.Errorf("expected `auto` to be the default Gemini entry, got %+v", auto)
+
+	sonnet, ok := ids["claude-sonnet-5"]
+	if !ok {
+		t.Fatalf("missing Claude Sonnet 5 in: %+v", models)
 	}
-	for _, m := range models {
-		if m.Provider != "google" {
-			t.Errorf("all Gemini entries must carry Provider=google, got %+v", m)
-		}
+	if sonnet.Label != "Claude Sonnet 5" || sonnet.Provider != "anthropic" || sonnet.Default {
+		t.Errorf("unexpected Sonnet 5 entry: %+v", sonnet)
+	}
+	if defaults != 1 || !ids["claude-sonnet-4-6"].Default {
+		t.Errorf("expected Sonnet 4.6 to remain the sole default, got defaults=%d models=%+v", defaults, models)
 	}
 }
 
-func TestCodexStaticModelsExposesGPT55(t *testing.T) {
-	// Codex CLI has no `models list` subcommand so the catalog is
-	// hand-maintained. Regression guard for multica-ai/multica#2009 —
-	// GPT-5.5 must be selectable, and the badge default must point at
-	// the latest release rather than lagging a version behind.
+func TestClaudeStaticModelsExposesOpus5(t *testing.T) {
+	models := claudeStaticModels()
+	ids := map[string]Model{}
+	defaults := 0
+	for _, m := range models {
+		ids[m.ID] = m
+		if m.Default {
+			defaults++
+		}
+	}
+
+	opus, ok := ids["claude-opus-5"]
+	if !ok {
+		t.Fatalf("missing Claude Opus 5 in: %+v", models)
+	}
+	if opus.Label != "Claude Opus 5" || opus.Provider != "anthropic" || opus.Default {
+		t.Errorf("unexpected Opus 5 entry: %+v", opus)
+	}
+	// Opus stays a deliberate opt-in: Sonnet remains the everyday workhorse
+	// the catalog badges as its default pick.
+	if defaults != 1 || !ids["claude-sonnet-4-6"].Default {
+		t.Errorf("expected Sonnet 4.6 to remain the sole default, got defaults=%d models=%+v", defaults, models)
+	}
+}
+
+// TestClaudeOpus5AcceptedByProviderCompatibilityGate pins the other half of
+// catalog membership: ModelKnownIncompatibleWithProvider erases a saved model
+// that a runtime's maintained catalog doesn't advertise, so an unlisted
+// `claude-opus-5` would be silently dropped from an agent on save.
+func TestClaudeOpus5AcceptedByProviderCompatibilityGate(t *testing.T) {
+	t.Parallel()
+	if ModelKnownIncompatibleWithProvider("claude", "claude-opus-5") {
+		t.Error("claude-opus-5 must be accepted by the claude provider gate")
+	}
+	if !ModelKnownIncompatibleWithProvider("codex", "claude-opus-5") {
+		t.Error("claude-opus-5 must still be rejected for the codex provider")
+	}
+}
+
+func TestCodexStaticModelsMatchVerifiedFallbackCatalog(t *testing.T) {
+	// This fallback is used for Codex <0.122.0 and whenever dynamic bundled
+	// discovery fails. Keep the latest verified visible models plus 5.3 Codex
+	// for older installations, but do not resurrect guessed/nonexistent IDs.
 	models := codexStaticModels()
 	ids := map[string]Model{}
 	for _, m := range models {
 		ids[m.ID] = m
 	}
 	for _, want := range []string{
-		"gpt-5.5", "gpt-5.5-mini",
-		"gpt-5.4", "gpt-5.4-mini",
-		"gpt-5.3-codex", "gpt-5",
-		"o3", "o3-mini",
+		"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+		"gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
+		"gpt-5.3-codex", "gpt-5.2",
 	} {
 		if _, ok := ids[want]; !ok {
 			t.Errorf("missing expected Codex model %q in: %+v", want, models)
 		}
 	}
-	latest, ok := ids["gpt-5.5"]
+	for _, unwanted := range []string{"gpt-5.5-mini", "gpt-5", "o3", "o3-mini"} {
+		if _, ok := ids[unwanted]; ok {
+			t.Errorf("unexpected stale/invalid Codex model %q in fallback: %+v", unwanted, models)
+		}
+	}
+	latest, ok := ids["gpt-5.6-sol"]
 	if !ok || !latest.Default {
-		t.Errorf("expected `gpt-5.5` to be the default Codex entry, got %+v", latest)
+		t.Errorf("expected `gpt-5.6-sol` to be the default Codex entry, got %+v", latest)
 	}
 	defaults := 0
 	for _, m := range models {
@@ -146,6 +199,87 @@ func TestCodexStaticModelsExposesGPT55(t *testing.T) {
 	}
 	if defaults != 1 {
 		t.Errorf("expected exactly one default Codex entry, got %d", defaults)
+	}
+	if got := ids["gpt-5.6-sol"].Thinking; got == nil || got.DefaultLevel != "low" || !hasThinkingLevel(got, "max") || !hasThinkingLevel(got, "ultra") {
+		t.Errorf("unexpected gpt-5.6-sol thinking catalog: %+v", got)
+	}
+	if got := ids["gpt-5.6-luna"].Thinking; got == nil || !hasThinkingLevel(got, "max") || hasThinkingLevel(got, "ultra") {
+		t.Errorf("unexpected gpt-5.6-luna thinking catalog: %+v", got)
+	}
+	if got := ids["gpt-5.3-codex"].Thinking; got == nil || !hasThinkingLevel(got, "xhigh") || hasThinkingLevel(got, "max") || hasThinkingLevel(got, "ultra") {
+		t.Errorf("unexpected gpt-5.3-codex thinking catalog: %+v", got)
+	}
+}
+
+func TestModelKnownIncompatibleWithProvider(t *testing.T) {
+	cases := []struct {
+		name     string
+		provider string
+		model    string
+		want     bool
+	}{
+		{
+			name:     "claude model is incompatible with codex",
+			provider: "codex",
+			model:    "claude-sonnet-4-6",
+			want:     true,
+		},
+		{
+			name:     "codex model is compatible with codex",
+			provider: "codex",
+			model:    "gpt-5.5",
+			want:     false,
+		},
+		{
+			name:     "codex model is incompatible with claude",
+			provider: "claude",
+			model:    "o3",
+			want:     true,
+		},
+		{
+			name:     "exact claude model is compatible with claude",
+			provider: "claude",
+			model:    "claude-opus-4-7",
+			want:     false,
+		},
+		{
+			name:     "provider-prefixed openai model is incompatible with codex",
+			provider: "codex",
+			model:    "openai/gpt-4o",
+			want:     true,
+		},
+		{
+			name:     "provider-prefixed anthropic model is incompatible with claude",
+			provider: "claude",
+			model:    "anthropic/claude-opus-4.7",
+			want:     true,
+		},
+		{
+			name:     "known openai-looking model outside codex catalog is incompatible",
+			provider: "codex",
+			model:    "gpt-99",
+			want:     true,
+		},
+		{
+			name:     "unknown custom model is not classified",
+			provider: "codex",
+			model:    "private-lab-model",
+			want:     false,
+		},
+		{
+			name:     "unknown target provider does not clear",
+			provider: "opencode",
+			model:    "claude-sonnet-4-6",
+			want:     false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ModelKnownIncompatibleWithProvider(tc.provider, tc.model); got != tc.want {
+				t.Fatalf("ModelKnownIncompatibleWithProvider(%q, %q) = %v, want %v", tc.provider, tc.model, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -235,11 +369,11 @@ func TestListModelsHermesWithoutBinary(t *testing.T) {
 	delete(modelCache, "hermes")
 	modelCacheMu.Unlock()
 
-	got, err := ListModels(ctx, "hermes", "/nonexistent/hermes")
+	got, err := ListModels(ctx, "hermes", missingAgentExecutable(t, "hermes"))
 	if err != nil {
 		t.Fatalf("ListModels(hermes) error: %v", err)
 	}
-	if got == nil {
+	if got.Models == nil {
 		t.Error("expected non-nil slice even when binary is missing")
 	}
 }
@@ -250,11 +384,41 @@ func TestListModelsKiroWithoutBinary(t *testing.T) {
 	delete(modelCache, "kiro")
 	modelCacheMu.Unlock()
 
-	got, err := ListModels(ctx, "kiro", "/nonexistent/kiro-cli")
+	got, err := ListModels(ctx, "kiro", missingAgentExecutable(t, "kiro-cli"))
 	if err != nil {
 		t.Fatalf("ListModels(kiro) error: %v", err)
 	}
-	if got == nil {
+	if got.Models == nil {
+		t.Error("expected non-nil slice even when binary is missing")
+	}
+}
+
+func TestListModelsQoderWithoutBinary(t *testing.T) {
+	ctx := context.Background()
+	modelCacheMu.Lock()
+	delete(modelCache, "qoder")
+	modelCacheMu.Unlock()
+
+	got, err := ListModels(ctx, "qoder", missingAgentExecutable(t, "qodercli"))
+	if err != nil {
+		t.Fatalf("ListModels(qoder) error: %v", err)
+	}
+	if got.Models == nil {
+		t.Error("expected non-nil slice even when binary is missing")
+	}
+}
+
+func TestListModelsQoderCNWithoutBinary(t *testing.T) {
+	ctx := context.Background()
+	modelCacheMu.Lock()
+	delete(modelCache, "qoderclicn")
+	modelCacheMu.Unlock()
+
+	got, err := ListModels(ctx, "qoderclicn", missingAgentExecutable(t, "qoderclicn"))
+	if err != nil {
+		t.Fatalf("ListModels(qoderclicn) error: %v", err)
+	}
+	if got.Models == nil {
 		t.Error("expected non-nil slice even when binary is missing")
 	}
 }
@@ -274,7 +438,6 @@ func TestStaticCatalogsHaveAtMostOneDefault(t *testing.T) {
 	catalogs := map[string][]Model{
 		"claude":  claudeStaticModels(),
 		"codex":   codexStaticModels(),
-		"gemini":  geminiStaticModels(),
 		"cursor":  cursorStaticModels(),
 		"copilot": copilotStaticModels(),
 	}
@@ -449,16 +612,16 @@ func TestCachedDiscoveryDoesNotCacheEmpty(t *testing.T) {
 	t.Cleanup(resetCache)
 
 	emptyCalls := 0
-	empty := func() ([]Model, error) {
+	empty := func() (Catalog, error) {
 		emptyCalls++
-		return []Model{}, nil
+		return Catalog{Models: []Model{}}, nil
 	}
 	for i := 0; i < 2; i++ {
 		got, err := cachedDiscovery(emptyKey, empty)
 		if err != nil {
 			t.Fatalf("cachedDiscovery: %v", err)
 		}
-		if len(got) != 0 {
+		if len(got.Models) != 0 {
 			t.Fatalf("expected empty result, got %+v", got)
 		}
 	}
@@ -467,9 +630,9 @@ func TestCachedDiscoveryDoesNotCacheEmpty(t *testing.T) {
 	}
 
 	nonEmptyCalls := 0
-	nonEmpty := func() ([]Model, error) {
+	nonEmpty := func() (Catalog, error) {
 		nonEmptyCalls++
-		return []Model{{ID: "provider/model"}}, nil
+		return Catalog{Models: []Model{{ID: "provider/model"}}}, nil
 	}
 	for i := 0; i < 2; i++ {
 		if _, err := cachedDiscovery(nonEmptyKey, nonEmpty); err != nil {
@@ -808,6 +971,31 @@ func TestParseHermesSessionNewModels(t *testing.T) {
 	}
 }
 
+func TestParseHermesSessionNewModelsPreservesCustomModelIDsWithColons(t *testing.T) {
+	raw := []byte(`{
+      "sessionId": "ses_123",
+      "models": {
+        "availableModels": [
+          {"modelId": "custom:lfm2.5:8b", "name": "lfm2.5:8b", "description": "Provider: Custom"}
+        ],
+        "currentModelId": "custom:lfm2.5:8b"
+      }
+    }`)
+	models := parseACPSessionNewModels(raw)
+	if len(models) != 1 {
+		t.Fatalf("expected 1 model, got %d: %+v", len(models), models)
+	}
+	if models[0].ID != "custom:lfm2.5:8b" {
+		t.Errorf("model id must be preserved verbatim, got %+v", models[0])
+	}
+	if models[0].Provider != "custom" {
+		t.Errorf("provider should be derived from the first colon only, got %+v", models[0])
+	}
+	if !models[0].Default {
+		t.Errorf("current custom model should be marked default: %+v", models[0])
+	}
+}
+
 func TestParseHermesSessionNewModelsSnakeCaseAndUnknownNames(t *testing.T) {
 	raw := []byte(`{
       "session_id": "ses_123",
@@ -847,6 +1035,140 @@ func TestParseHermesSessionNewModelsMissingField(t *testing.T) {
 func TestParseHermesSessionNewModelsGarbage(t *testing.T) {
 	if got := parseACPSessionNewModels([]byte("not json")); got != nil {
 		t.Errorf("expected nil for non-JSON, got %+v", got)
+	}
+}
+
+// MUL-5239: kimi-code 0.29 dropped the `models` block and advertises the
+// same catalog through ACP `configOptions`. Without this the picker showed
+// an empty catalog for an online kimi runtime.
+func TestParseACPSessionNewModelsFromConfigOptions(t *testing.T) {
+	// Trimmed copy of a real kimi 0.29 session/new result.
+	raw := []byte(`{
+      "sessionId": "session_abc",
+      "configOptions": [
+        {
+          "type": "select",
+          "id": "model",
+          "name": "Model",
+          "category": "model",
+          "currentValue": "kimi-code/k3",
+          "options": [
+            {"value": "kimi-code/kimi-for-coding", "name": "K2.7 Coding"},
+            {"value": "kimi-code/kimi-for-coding-highspeed", "name": "K2.7 Coding Highspeed"},
+            {"value": "kimi-code/k3", "name": "K3"}
+          ]
+        },
+        {
+          "type": "select",
+          "id": "thinking",
+          "category": "thought_level",
+          "currentValue": "high",
+          "options": [
+            {"value": "low", "name": "Low"},
+            {"value": "high", "name": "High"},
+            {"value": "max", "name": "Max"}
+          ]
+        }
+      ]
+    }`)
+	models := parseACPSessionNewModels(raw)
+	if len(models) != 3 {
+		t.Fatalf("expected 3 models from configOptions, got %d: %+v", len(models), models)
+	}
+	if models[0].ID != "kimi-code/kimi-for-coding" || models[0].Label != "K2.7 Coding" {
+		t.Errorf("unexpected first model: %+v", models[0])
+	}
+	// `kimi-code/k3` has no colon, so it must not be split into a provider
+	// group off the slash.
+	if models[2].Provider != "" {
+		t.Errorf("slash-form model id must not derive a provider: %+v", models[2])
+	}
+	if !models[2].Default {
+		t.Errorf("currentValue entry must be marked default: %+v", models[2])
+	}
+	for _, m := range models {
+		if m.ID == "low" || m.ID == "high" || m.ID == "max" {
+			t.Errorf("thinking-level option leaked into the model catalog: %+v", m)
+		}
+	}
+}
+
+// The `models` block stays authoritative: an agent emitting both shapes
+// must not have its catalog replaced by configOptions.
+func TestParseACPSessionNewModelsPrefersModelsBlockOverConfigOptions(t *testing.T) {
+	raw := []byte(`{
+      "sessionId": "session_abc",
+      "models": {
+        "availableModels": [{"modelId": "nous:anthropic/claude-opus-4.7", "name": "Opus"}],
+        "currentModelId": "nous:anthropic/claude-opus-4.7"
+      },
+      "configOptions": [
+        {"id": "model", "category": "model", "currentValue": "other/one",
+         "options": [{"value": "other/one", "name": "Other"}]}
+      ]
+    }`)
+	models := parseACPSessionNewModels(raw)
+	if len(models) != 1 || models[0].ID != "nous:anthropic/claude-opus-4.7" {
+		t.Fatalf("models block must win over configOptions, got %+v", models)
+	}
+}
+
+func TestParseACPSessionNewModelsConfigOptionsSnakeCaseAndCategoryOnly(t *testing.T) {
+	// No `id: "model"` — the option is identified by category alone — and
+	// the response uses snake_case keys.
+	raw := []byte(`{
+      "session_id": "session_abc",
+      "config_options": [
+        {
+          "id": "primary_model",
+          "category": "MODEL",
+          "current_value": "kimi-code/k3",
+          "options": [
+            {"value": "kimi-code/k3", "name": "K3"},
+            {"value": "kimi-code/k3", "name": "duplicate"},
+            {"value": "  ", "name": "blank"},
+            {"value": "kimi-code/kimi-for-coding", "name": ""}
+          ]
+        }
+      ]
+    }`)
+	models := parseACPSessionNewModels(raw)
+	if len(models) != 2 {
+		t.Fatalf("expected 2 models (duplicate and blank dropped), got %d: %+v", len(models), models)
+	}
+	if !models[0].Default {
+		t.Errorf("snake_case current_value should mark default: %+v", models[0])
+	}
+	if models[1].Label != "kimi-code/kimi-for-coding" {
+		t.Errorf("missing name should fall back to the model id, got %+v", models[1])
+	}
+}
+
+func TestParseACPSessionNewModelsIgnoresNonModelConfigOptions(t *testing.T) {
+	// session/new with configOptions but no model picker must still yield an
+	// empty catalog rather than inventing one from the thinking levels.
+	raw := []byte(`{
+      "sessionId": "session_abc",
+      "configOptions": [
+        {"id": "thinking", "category": "thought_level", "currentValue": "high",
+         "options": [{"value": "low", "name": "Low"}, {"value": "high", "name": "High"}]}
+      ]
+    }`)
+	if got := parseACPSessionNewModels(raw); len(got) != 0 {
+		t.Errorf("expected empty catalog, got %+v", got)
+	}
+}
+
+func TestACPResultTopLevelKeys(t *testing.T) {
+	// Diagnostic line must expose key names only — never the values that
+	// carry session ids or catalog contents.
+	keys := acpResultTopLevelKeys([]byte(`{"sessionId":"session_secret","configOptions":[],"modes":{}}`))
+	got := strings.Join(keys, ",")
+	if got != "configOptions,modes,sessionId" {
+		t.Errorf("unexpected keys: %q", got)
+	}
+	if acpResultTopLevelKeys([]byte("not json")) != nil {
+		t.Error("expected nil for non-JSON result")
 	}
 }
 
@@ -894,7 +1216,7 @@ func TestParseAntigravityModels(t *testing.T) {
 		t.Fatalf("parseAntigravityModels len = %d, want %d (%+v)", len(got), len(want), got)
 	}
 	for i := range want {
-		if got[i] != want[i] {
+		if !reflect.DeepEqual(got[i], want[i]) {
 			t.Errorf("model[%d] = %+v, want %+v", i, got[i], want[i])
 		}
 	}
@@ -912,9 +1234,9 @@ func TestParseAntigravityModelsEmpty(t *testing.T) {
 
 func TestCachedDiscovery(t *testing.T) {
 	calls := 0
-	fn := func() ([]Model, error) {
+	fn := func() (Catalog, error) {
 		calls++
-		return []Model{{ID: "x", Label: "x"}}, nil
+		return Catalog{Models: []Model{{ID: "x", Label: "x"}}}, nil
 	}
 	// First call populates the cache; reset for isolation.
 	modelCacheMu.Lock()

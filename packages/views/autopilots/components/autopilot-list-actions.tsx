@@ -81,7 +81,7 @@ export function DeleteAutopilotsDialog({
             })}
           </DialogDescription>
         </DialogHeader>
-        <p className="text-xs text-muted-foreground">
+        <p className="text-caption text-muted-foreground">
           {t(($) => $.actions.delete_dialog.warning)}
         </p>
         <DialogFooter>
@@ -145,6 +145,11 @@ export function AutopilotRowActions({ row }: { row: Autopilot }) {
   const { t } = useT("autopilots");
   const [deleteOpen, setDeleteOpen] = useState(false);
   const setStatus = useSetStatus();
+
+  // The kebab only holds write actions (pause/resume/delete). Hide it entirely
+  // for members without write access; an absent can_write (older server) keeps
+  // the menu visible and lets the backend remain the gate.
+  if (row.can_write === false) return null;
 
   return (
     <span
@@ -221,7 +226,7 @@ export function AutopilotBatchToolbar({
           skills batch toolbar for the rationale. */}
       <div className="absolute bottom-6 left-1/2 z-50 flex -translate-x-1/2 items-center gap-1 rounded-lg border bg-background px-2 py-1.5 shadow-lg">
         <div className="mr-1 flex items-center gap-1.5 border-r pl-1 pr-2">
-          <span className="text-sm font-medium">
+          <span className="text-body font-medium">
             {t(($) => $.actions.selected, { count: rows.length })}
           </span>
           <button

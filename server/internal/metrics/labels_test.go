@@ -12,6 +12,23 @@ func TestBusinessMetricLabelsRejectHighCardinalityNames(t *testing.T) {
 	}
 }
 
+func TestNormalizeRuntimeProviderRecognizesKnownProviders(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{input: "QWEN", want: "qwen"},
+		{input: "Qoder", want: "qoder"},
+		{input: "QODERCLICN", want: "qoderclicn"},
+		{input: "TraeCLI", want: "traecli"},
+	}
+	for _, tt := range tests {
+		if got := NormalizeRuntimeProvider(tt.input); got != tt.want {
+			t.Errorf("NormalizeRuntimeProvider(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
 func TestNormalizeLabelsCollapseUnknownValues(t *testing.T) {
 	if got := NormalizeRuntimeProvider("provider-from-user-input"); got != "other" {
 		t.Fatalf("NormalizeRuntimeProvider unknown = %q, want other", got)

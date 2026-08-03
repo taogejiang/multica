@@ -12,6 +12,7 @@
 import { z } from "zod";
 import type {
   Agent,
+  AgentInvocationTarget,
   AgentTask,
   Attachment,
   ChatMessage,
@@ -89,6 +90,7 @@ export const CommentSchema = z.object({
   resolved_at: z.string().nullable().default(null),
   resolved_by_type: z.string().nullable().default(null),
   resolved_by_id: z.string().nullable().default(null),
+  source_task_id: z.string().nullable().optional(),
 }).loose() as unknown as z.ZodType<Comment>;
 
 export const EMPTY_COMMENT: Comment = {
@@ -161,6 +163,10 @@ export const ProjectSchema = z.object({
   priority: z.string(),
   lead_type: z.string().nullable(),
   lead_id: z.string().nullable(),
+  // .default(null) so a project from an older backend that omits these keys
+  // parses to null instead of degrading the batch to the empty fallback.
+  start_date: z.string().nullable().default(null),
+  due_date: z.string().nullable().default(null),
   created_at: z.string(),
   updated_at: z.string(),
   issue_count: z.number().default(0),
@@ -194,6 +200,8 @@ export const EMPTY_PROJECT: Project = {
   priority: "none",
   lead_type: null,
   lead_id: null,
+  start_date: null,
+  due_date: null,
   created_at: "",
   updated_at: "",
   issue_count: 0,
@@ -244,6 +252,10 @@ export const ChatSessionSchema: z.ZodType<ChatSession> = z.object({
   // unknown server values fall back to "active" so the row still renders.
   status: z.enum(["active", "archived"]).catch("active"),
   has_unread: z.boolean().default(false),
+  // Unread assistant messages after the read cursor. Optional (not defaulted)
+  // so the badge math can tell "older server didn't send it" from a real 0 —
+  // the tab badge sums `unread_count ?? 0`, same rule as web's sidebar.
+  unread_count: z.number().optional(),
   created_at: z.string().default(""),
   updated_at: z.string().default(""),
 }).loose();
@@ -267,6 +279,15 @@ export const ChatMessageSchema: z.ZodType<ChatMessage> = z.object({
   attachments: z.array(AttachmentSchema).optional(),
   failure_reason: z.string().nullable().optional(),
   elapsed_ms: z.number().nullable().optional(),
+  message_kind: z.enum(["message", "no_response"]).catch("message").optional(),
+  // One malformed optional suggestion must not erase an otherwise valid
+  // conversation. The server validates these too; this is mixed-version and
+  // corrupted-cache defense at the mobile boundary.
+  quick_actions: z.array(z.object({
+    label: z.string(),
+    prompt: z.string(),
+    primary: z.boolean().optional(),
+  }).loose()).catch([]).optional().default([]),
 }).loose();
 
 export const ChatMessageListSchema = z.array(ChatMessageSchema).default([]);
@@ -545,6 +566,18 @@ export const MemberWithUserSchema: z.ZodType<MemberWithUser> = z.object({
 export const MemberListSchema = z.array(MemberWithUserSchema).default([]);
 export const EMPTY_MEMBER_LIST: MemberWithUser[] = [];
 
+const AgentInvocationTargetSchema: z.ZodType<AgentInvocationTarget> = z
+  .object({
+    target_type: z.enum(["workspace", "member", "team"]).catch("team"),
+    target_id: z
+      .string()
+      .nullable()
+      .optional()
+      .catch(null)
+      .transform((v) => v ?? null),
+  })
+  .loose();
+
 // Agent schema is loose on every enum / structural field — the agent table is
 // where new modes/visibilities/statuses get added most often. We need only id,
 // name, avatar_url, and a couple of flags for the assignee picker + chat
@@ -553,6 +586,7 @@ export const AgentSchema: z.ZodType<Agent> = z.object({
   id: z.string(),
   workspace_id: z.string().default(""),
   runtime_id: z.string().default(""),
+  runtime_bound: z.boolean().optional(),
   name: z.string().default(""),
   description: z.string().default(""),
   instructions: z.string().default(""),
@@ -571,6 +605,8 @@ export const AgentSchema: z.ZodType<Agent> = z.object({
   visibility: z.string().catch("workspace") as unknown as z.ZodType<
     Agent["visibility"]
   >,
+  permission_mode: z.enum(["private", "public_to"]).catch("private"),
+  invocation_targets: z.array(AgentInvocationTargetSchema).default([]),
   status: z.string().catch("active") as unknown as z.ZodType<Agent["status"]>,
   max_concurrent_tasks: z.number().default(1),
   model: z.string().default(""),
@@ -663,9 +699,11 @@ export const EMPTY_ISSUE_FALLBACK: import("@multica/core/types").Issue = {
   parent_issue_id: null,
   project_id: null,
   position: 0,
+  stage: null,
   start_date: null,
   due_date: null,
   metadata: {},
+  properties: {},
   created_at: "",
   updated_at: "",
 };

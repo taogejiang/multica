@@ -1,7 +1,5 @@
 "use client";
 
-import { useMemo } from "react";
-import { useStore } from "zustand";
 import { ChevronDown } from "lucide-react";
 import { Button } from "@multica/ui/components/ui/button";
 import {
@@ -12,13 +10,44 @@ import {
   DropdownMenuTrigger,
 } from "@multica/ui/components/ui/dropdown-menu";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@multica/ui/components/ui/tooltip";
-import type { Issue } from "@multica/core/types";
-import { myIssuesViewStore, type MyIssuesScope } from "@multica/core/issues/stores/my-issues-view-store";
+import type {
+  Issue,
+  IssueTableFacetSpec,
+  IssueTableFacetsResponse,
+  WorkingAgentSummary,
+} from "@multica/core/types";
+import { type MyIssuesScope } from "@multica/core/issues/stores/my-issues-view-store";
+import { useViewStore } from "@multica/core/issues/stores/view-store-context";
 import { useT } from "../../i18n";
 import { WorkspaceAgentWorkingChip } from "../../issues/components/workspace-agent-working-chip";
-import { IssueDisplayControls } from "../../issues/components/issues-header";
+import {
+  IssueDisplayControls,
+  ViewRefreshIndicator,
+} from "../../issues/components/issues-header";
 
-export function MyIssuesHeader({ allIssues }: { allIssues: Issue[] }) {
+export function MyIssuesHeader({
+  allIssues,
+  workingAgents,
+  scope,
+  onScopeChange,
+  isRefreshing = false,
+  facetCountsExact = true,
+  tableFacetCounts,
+  onTableFacetChange,
+}: {
+  allIssues: Issue[];
+  /** See IssueSurfaceController.workingAgents. My Issues used to ask the
+   *  working-agents endpoint for its own relation-scoped count; the surface
+   *  projection now covers the relation AND every active filter. */
+  workingAgents: WorkingAgentSummary[] | undefined;
+  scope: MyIssuesScope;
+  onScopeChange: (scope: MyIssuesScope) => void;
+  isRefreshing?: boolean;
+  /** See IssueDisplayControls.facetCountsExact. */
+  facetCountsExact?: boolean;
+  tableFacetCounts?: IssueTableFacetsResponse;
+  onTableFacetChange: (facet: IssueTableFacetSpec | null) => void;
+}) {
   const { t } = useT("my-issues");
   const { t: tIssues } = useT("issues");
   const SCOPES: { value: MyIssuesScope; label: string; description: string }[] = [
@@ -27,12 +56,9 @@ export function MyIssuesHeader({ allIssues }: { allIssues: Issue[] }) {
     { value: "created", label: t(($) => $.header.scope.created_label), description: t(($) => $.header.scope.created_description) },
     { value: "agents", label: t(($) => $.header.scope.agents_label), description: t(($) => $.header.scope.agents_description) },
   ];
-  const scope = useStore(myIssuesViewStore, (s) => s.scope);
-  const agentRunningFilter = useStore(myIssuesViewStore, (s) => s.agentRunningFilter);
-  const act = myIssuesViewStore.getState();
-  const scopedIssueIds = useMemo(
-    () => new Set(allIssues.map((i) => i.id)),
-    [allIssues],
+  const agentRunningFilter = useViewStore((s) => s.agentRunningFilter);
+  const toggleAgentRunningFilter = useViewStore(
+    (s) => s.toggleAgentRunningFilter,
   );
   const scopeLabel = SCOPES.find((s) => s.value === scope)?.label ?? SCOPES[0]?.label;
 
@@ -52,7 +78,7 @@ export function MyIssuesHeader({ allIssues }: { allIssues: Issue[] }) {
                         ? "bg-accent text-accent-foreground hover:bg-accent/80"
                         : "text-muted-foreground"
                     }
-                    onClick={() => act.setScope(s.value)}
+                    onClick={() => onScopeChange(s.value)}
                   >
                     {s.label}
                   </Button>
@@ -79,7 +105,7 @@ export function MyIssuesHeader({ allIssues }: { allIssues: Issue[] }) {
           <DropdownMenuContent align="start" className="w-auto">
             <DropdownMenuRadioGroup
               value={scope}
-              onValueChange={(value) => act.setScope(value as MyIssuesScope)}
+              onValueChange={(value) => onScopeChange(value as MyIssuesScope)}
             >
               {SCOPES.map((s) => (
                 <DropdownMenuRadioItem key={s.value} value={s.value}>
@@ -92,16 +118,22 @@ export function MyIssuesHeader({ allIssues }: { allIssues: Issue[] }) {
 
         <div className="flex shrink-0 items-center gap-1">
           {agentRunningFilter && (
-            <span className="mr-1 hidden text-xs text-muted-foreground md:inline">
+            <span className="mr-1 hidden text-caption text-muted-foreground md:inline">
               {tIssues(($) => $.agent_activity.filter_active_label)}
             </span>
           )}
           <WorkspaceAgentWorkingChip
             value={agentRunningFilter}
-            onToggle={act.toggleAgentRunningFilter}
-            scopedIssueIds={scopedIssueIds}
+            onToggle={toggleAgentRunningFilter}
+            agents={workingAgents}
           />
-          <IssueDisplayControls scopedIssues={allIssues} />
+          <IssueDisplayControls
+            scopedIssues={allIssues}
+            facetCountsExact={facetCountsExact}
+            tableFacetCounts={tableFacetCounts}
+            onTableFacetChange={onTableFacetChange}
+          />
+          <ViewRefreshIndicator active={isRefreshing} />
         </div>
       </div>
     </div>

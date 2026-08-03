@@ -5,6 +5,7 @@ import {
   XCircle,
   ArrowUpCircle,
   Check,
+  Lock,
 } from "lucide-react";
 import { Button } from "@multica/ui/components/ui/button";
 import { api } from "@multica/core/api";
@@ -64,7 +65,8 @@ const statusConfig: Record<
 };
 
 interface UpdateSectionProps {
-  runtimeId: string;
+  /** Null for a read-only viewer who cannot use a runtime as the command channel. */
+  runtimeId: string | null;
   currentVersion: string | null;
   isOnline: boolean;
   /**
@@ -128,7 +130,7 @@ export function UpdateSection({
   }, [currentVersion, markCompleted, targetVersion, updating]);
 
   const handleUpdate = async () => {
-    if (!latestVersion) return;
+    if (!latestVersion || !runtimeId) return;
     cleanup();
     setUpdating(true);
     setTargetVersion(latestVersion);
@@ -181,14 +183,14 @@ export function UpdateSection({
   return (
     <div className="space-y-2">
       <div className="flex items-center gap-2 flex-wrap">
-        <span className="text-xs text-muted-foreground">{t(($) => $.update.cli_version_label)}</span>
-        <span className="text-xs font-mono">
+        <span className="text-caption text-muted-foreground">{t(($) => $.update.cli_version_label)}</span>
+        <span className="text-caption font-mono">
           {currentVersion ?? t(($) => $.update.version_unknown)}
         </span>
 
         {isManaged ? (
           <span
-            className="inline-flex items-center gap-1 text-xs text-muted-foreground"
+            className="inline-flex items-center gap-1 text-caption text-muted-foreground"
             title={t(($) => $.update.managed_by_desktop_title)}
           >
             {t(($) => $.update.managed_by_desktop)}
@@ -196,7 +198,7 @@ export function UpdateSection({
         ) : (
           <>
             {!hasUpdate && currentVersion && latestVersion && !status && (
-              <span className="inline-flex items-center gap-1 text-xs text-success">
+              <span className="inline-flex items-center gap-1 text-caption text-success">
                 <Check className="h-3 w-3" />
                 {t(($) => $.update.latest)}
               </span>
@@ -204,15 +206,25 @@ export function UpdateSection({
 
             {hasUpdate && !status && (
               <>
-                <span className="text-xs text-muted-foreground">→</span>
-                <span className="text-xs font-mono text-info">
+                <span className="text-caption text-muted-foreground">→</span>
+                <span className="text-caption font-mono text-info">
                   {latestVersion}
                 </span>
-                <span className="text-xs text-muted-foreground">{t(($) => $.update.available)}</span>
+                <span className="text-caption text-muted-foreground">{t(($) => $.update.available)}</span>
               </>
             )}
 
-            {hasUpdate && isOnline && !status && (
+            {hasUpdate && !runtimeId && (
+              <span
+                className="inline-flex items-center gap-1 text-caption text-muted-foreground"
+                title={t(($) => $.update.read_only_title)}
+              >
+                <Lock className="h-3 w-3" />
+                {t(($) => $.update.read_only)}
+              </span>
+            )}
+
+            {hasUpdate && runtimeId && isOnline && !status && (
               <Button
                 variant="outline"
                 size="xs"
@@ -228,7 +240,7 @@ export function UpdateSection({
 
         {config && Icon && status && (
           <span
-            className={`inline-flex items-center gap-1 text-xs ${config.color}`}
+            className={`inline-flex items-center gap-1 text-caption ${config.color}`}
           >
             <Icon className={`h-3 w-3 ${isActive ? "animate-spin" : ""}`} />
             {t(($) => $.update.status[status])}
@@ -238,13 +250,13 @@ export function UpdateSection({
 
       {status === "completed" && output && (
         <div className="rounded-lg border bg-success/5 px-3 py-2">
-          <p className="text-xs text-success">{output}</p>
+          <p className="text-caption text-success">{output}</p>
         </div>
       )}
 
       {(status === "failed" || status === "timeout") && error && (
         <div className="rounded-lg border border-destructive/20 bg-destructive/5 px-3 py-2">
-          <p className="text-xs text-destructive">{error}</p>
+          <p className="text-caption text-destructive">{error}</p>
           {status === "failed" && (
             <Button
               variant="ghost"

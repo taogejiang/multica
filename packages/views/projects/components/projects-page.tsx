@@ -27,6 +27,7 @@ import {
   type ProjectColumnKey,
   type ProjectListFilters,
   type ProjectSortField,
+  type ProjectViewMode,
 } from "@multica/core/projects";
 import {
   pinListOptions,
@@ -58,7 +59,9 @@ import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,
   DropdownMenuSeparator,
@@ -94,7 +97,11 @@ import type {
   ProjectStatus,
   UpdateProjectRequest,
 } from "@multica/core/types";
-import { PageHeader } from "../../layout/page-header";
+import {
+  CollectionPageHeader,
+  CollectionPageHeaderAction,
+  CollectionPageState,
+} from "../../layout/collection-page";
 import { ProjectIcon } from "./project-icon";
 import { useT } from "../../i18n";
 import { matchesPinyin } from "../../editor/extensions/pinyin-match";
@@ -181,7 +188,7 @@ function columnTrackVars(
 
 function ProgressRing({ project }: { project: Project }) {
   if (project.issue_count === 0) {
-    return <span className="text-xs text-muted-foreground/40">—</span>;
+    return <span className="text-caption text-faint-foreground">—</span>;
   }
   const pct = Math.round((project.done_count / project.issue_count) * 100);
   return (
@@ -202,7 +209,7 @@ function ProgressRing({ project }: { project: Project }) {
           />
         </svg>
       </span>
-      <span className="text-xs tabular-nums text-muted-foreground">
+      <span className="text-caption tabular-nums text-muted-foreground">
         {project.done_count}/{project.issue_count}
       </span>
     </span>
@@ -370,7 +377,7 @@ function ProjectTableRow({
       <CheckboxCell checked={selected} onToggle={onToggleSelect} />
       <ListGridCell className="gap-2">
         <ProjectIcon project={project} size="sm" />
-        <span className="min-w-0 truncate text-sm font-medium">
+        <span className="min-w-0 truncate text-body font-medium">
           {project.title}
         </span>
       </ListGridCell>
@@ -408,11 +415,11 @@ function ProjectTableRow({
                 className="flex min-w-0 items-center gap-1.5 rounded px-1 py-0.5 transition-colors hover:bg-accent/60"
               >
                 {project.lead_type && project.lead_id ? (
-                  <ActorAvatar actorType={project.lead_type} actorId={project.lead_id} size={18} enableHoverCard />
+                  <ActorAvatar actorType={project.lead_type} actorId={project.lead_id} size="sm" enableHoverCard />
                 ) : (
                   <span className="inline-flex h-[18px] w-[18px] rounded-full border border-dashed border-muted-foreground/30" />
                 )}
-                <span className="min-w-0 truncate text-xs text-muted-foreground">
+                <span className="min-w-0 truncate text-caption text-muted-foreground">
                   {leadName ?? "—"}
                 </span>
               </button>
@@ -424,7 +431,7 @@ function ProjectTableRow({
       )}
 
       {isColVisible("issues") ? (
-        <ListGridCell className="hidden justify-end font-mono text-xs tabular-nums text-muted-foreground @2xl:flex">
+        <ListGridCell className="hidden justify-end font-mono text-caption tabular-nums text-muted-foreground @2xl:flex">
           {project.issue_count}
         </ListGridCell>
       ) : (
@@ -432,7 +439,7 @@ function ProjectTableRow({
       )}
 
       {isColVisible("created") ? (
-        <ListGridCell className="hidden whitespace-nowrap text-xs tabular-nums text-muted-foreground @2xl:flex">
+        <ListGridCell className="hidden whitespace-nowrap text-caption tabular-nums text-muted-foreground @2xl:flex">
           {formatRelativeDate(project.created_at)}
         </ListGridCell>
       ) : (
@@ -581,7 +588,7 @@ function ProjectCard({
             className="flex min-w-0 flex-1 items-center gap-2"
           >
             <ProjectIcon project={project} size="sm" />
-            <h3 className="truncate text-sm font-medium">{project.title}</h3>
+            <h3 className="truncate text-body font-medium">{project.title}</h3>
           </AppLink>
           <ProjectRowActions project={project} pinned={pinned} canDelete={canDelete} />
           <ProjectStatusBadge project={project} handleUpdate={handleUpdate} triggerClassName="shrink-0" />
@@ -605,12 +612,12 @@ function ProjectCard({
                 />
               </svg>
             </div>
-            <span className="text-[10px] tabular-nums text-muted-foreground">
+            <span className="text-micro tabular-nums text-muted-foreground">
               {project.done_count}/{project.issue_count}
             </span>
           </div>
         ) : (
-          <span className="flex justify-end pt-2 text-[10px] text-muted-foreground">
+          <span className="flex justify-end pt-2 text-micro text-muted-foreground">
             {t(($) => $.detail.no_issues_yet)}
           </span>
         )}
@@ -623,11 +630,11 @@ function ProjectCard({
           renderTrigger={(leadName) => (
             <button type="button" className="-mx-1.5 flex items-center gap-1.5 rounded px-1.5 py-0.5 transition-colors hover:bg-accent/60">
               {project.lead_type && project.lead_id ? (
-                <ActorAvatar actorType={project.lead_type} actorId={project.lead_id} size={20} enableHoverCard />
+                <ActorAvatar actorType={project.lead_type} actorId={project.lead_id} size="sm" enableHoverCard />
               ) : (
                 <span className="inline-flex h-5 w-5 rounded-full border border-dashed border-muted-foreground/30" />
               )}
-              <span className="max-w-[60px] truncate text-[10px] text-muted-foreground">
+              <span className="max-w-[60px] truncate text-micro text-muted-foreground">
                 {leadName ?? t(($) => $.lead.no_lead)}
               </span>
             </button>
@@ -635,7 +642,7 @@ function ProjectCard({
         />
         <div className="flex items-center gap-2">
           <ProjectPriorityBadge project={project} handleUpdate={handleUpdate} align="start" />
-          <span className="text-[10px] text-muted-foreground">
+          <span className="text-micro text-muted-foreground">
             {formatRelativeDate(project.created_at)}
           </span>
         </div>
@@ -693,7 +700,7 @@ function ProjectBatchToolbar({
     <>
       <div className="absolute bottom-6 left-1/2 z-50 flex -translate-x-1/2 items-center gap-1 rounded-lg border bg-background px-2 py-1.5 shadow-lg">
         <div className="mr-1 flex items-center gap-1.5 border-r pl-1 pr-2">
-          <span className="text-sm font-medium">
+          <span className="text-body font-medium">
             {t(($) => $.page.selected, { count: rows.length })}
           </span>
           <button
@@ -907,42 +914,35 @@ export function ProjectsPage() {
 
   const showEmpty = !isLoading && projects.length === 0;
   const countBadge = (n: number) => (
-    <span className="ml-auto pl-3 text-xs text-muted-foreground">{n}</span>
+    <span className="ml-auto pl-3 text-caption text-muted-foreground">{n}</span>
   );
 
   return (
     // relative: positioning anchor for the page-centered batch toolbar.
     <div className="relative flex flex-1 min-h-0 flex-col">
-      <PageHeader className="justify-between px-5">
-        <div className="flex items-center gap-2">
-          <FolderKanban className="h-4 w-4 text-muted-foreground" />
-          <h1 className="text-sm font-medium">{t(($) => $.page.title)}</h1>
-          {projects.length > 0 && (
-            <span className="font-mono text-xs tabular-nums text-muted-foreground/70">
-              {projects.length}
-            </span>
-          )}
-        </div>
-        <Button
-          size="sm"
-          variant="outline"
-          className="h-8 w-8 gap-1 px-0 md:w-auto md:px-2.5"
-          aria-label={t(($) => $.page.new_project)}
-          onClick={openCreateProject}
-        >
-          <Plus className="h-3.5 w-3.5" />
-          <span className="hidden md:inline">{t(($) => $.page.new_project)}</span>
-        </Button>
-      </PageHeader>
+      <CollectionPageHeader
+        icon={FolderKanban}
+        title={t(($) => $.page.title)}
+        count={projects.length}
+        actions={
+          <CollectionPageHeaderAction
+            icon={Plus}
+            label={t(($) => $.page.new_project)}
+            onClick={openCreateProject}
+          />
+        }
+      />
 
       {showEmpty ? (
-        <div className="flex flex-1 flex-col items-center justify-center py-24 text-muted-foreground">
-          <FolderKanban className="mb-3 h-10 w-10 opacity-30" />
-          <p className="text-sm">{t(($) => $.page.empty)}</p>
-          <Button size="sm" variant="outline" className="mt-3" onClick={openCreateProject}>
-            {t(($) => $.page.create_first)}
-          </Button>
-        </div>
+        <CollectionPageState
+          icon={FolderKanban}
+          title={t(($) => $.page.empty)}
+          actions={
+            <Button size="sm" variant="outline" onClick={openCreateProject}>
+              {t(($) => $.page.create_first)}
+            </Button>
+          }
+        />
       ) : (
         <>
           {/* Toolbar */}
@@ -953,14 +953,15 @@ export function ProjectsPage() {
                 <Input
                   value={search}
                   onChange={(e) => setSearch(e.target.value)}
+                  aria-label={t(($) => $.page.search_placeholder)}
                   placeholder={t(($) => $.page.search_placeholder)}
-                  className="h-8 w-56 pl-8 text-sm"
+                  className="h-8 w-56 pl-8 text-body"
                 />
               </div>
               {(hasActiveFilters || search.trim().length > 0) && (
                 <span
                   title={t(($) => $.toolbar.result_count_title)}
-                  className="hidden shrink-0 text-xs tabular-nums text-muted-foreground md:inline"
+                  className="hidden shrink-0 text-caption tabular-nums text-muted-foreground md:inline"
                 >
                   {visible.length} / {projects.length}
                 </span>
@@ -1016,7 +1017,7 @@ export function ProjectsPage() {
                     <DropdownMenuSubTrigger>
                       <span className="flex-1">{t(($) => $.toolbar.section_status)}</span>
                       {filters.statuses.length > 0 && (
-                        <span className="text-xs font-medium text-primary">{filters.statuses.length}</span>
+                        <span className="text-caption font-medium text-primary">{filters.statuses.length}</span>
                       )}
                     </DropdownMenuSubTrigger>
                     <DropdownMenuSubContent className="w-auto min-w-44">
@@ -1037,7 +1038,7 @@ export function ProjectsPage() {
                     <DropdownMenuSubTrigger>
                       <span className="flex-1">{t(($) => $.toolbar.section_priority)}</span>
                       {filters.priorities.length > 0 && (
-                        <span className="text-xs font-medium text-primary">{filters.priorities.length}</span>
+                        <span className="text-caption font-medium text-primary">{filters.priorities.length}</span>
                       )}
                     </DropdownMenuSubTrigger>
                     <DropdownMenuSubContent className="w-auto min-w-44">
@@ -1058,7 +1059,7 @@ export function ProjectsPage() {
                     <DropdownMenuSubTrigger>
                       <span className="flex-1">{t(($) => $.toolbar.section_lead)}</span>
                       {filters.leads.length > 0 && (
-                        <span className="text-xs font-medium text-primary">{filters.leads.length}</span>
+                        <span className="text-caption font-medium text-primary">{filters.leads.length}</span>
                       )}
                     </DropdownMenuSubTrigger>
                     <DropdownMenuSubContent className="max-h-72 w-auto min-w-48 overflow-y-auto">
@@ -1070,7 +1071,7 @@ export function ProjectsPage() {
                           className={FILTER_ITEM_CLASS}
                         >
                           <HoverCheck checked={filters.leads.includes(value)} />
-                          <ActorAvatar actorType={type} actorId={id} size={16} />
+                          <ActorAvatar actorType={type} actorId={id} size="sm" />
                           <span className="min-w-0 truncate">{getActorName(type, id)}</span>
                           {countBadge(count)}
                         </DropdownMenuCheckboxItem>
@@ -1102,12 +1103,12 @@ export function ProjectsPage() {
                   </Tooltip>
                   <PopoverContent align="end" className="w-64 p-0">
                     <div className="border-b px-3 py-2.5">
-                      <span className="text-xs font-medium text-muted-foreground">{t(($) => $.toolbar.sort_by)}</span>
+                      <span className="text-caption font-medium text-muted-foreground">{t(($) => $.toolbar.sort_by)}</span>
                       <div className="mt-2 flex items-center gap-1.5">
                         <DropdownMenu>
                           <DropdownMenuTrigger
                             render={
-                              <Button variant="outline" size="sm" className="flex-1 justify-between text-xs">
+                              <Button variant="outline" size="sm" className="flex-1 justify-between text-caption">
                                 {sortLabel(sortField)}
                                 <ChevronDown className="size-3 text-muted-foreground" />
                               </Button>
@@ -1138,11 +1139,11 @@ export function ProjectsPage() {
                     </div>
                     {isCompact && (
                       <div className="px-3 py-2.5">
-                        <span className="text-xs font-medium text-muted-foreground">{t(($) => $.toolbar.section_columns)}</span>
+                        <span className="text-caption font-medium text-muted-foreground">{t(($) => $.toolbar.section_columns)}</span>
                         <div className="mt-2 space-y-2">
                           {COLUMN_KEYS.map((key) => (
                             <label key={key} className="flex cursor-pointer items-center justify-between">
-                              <span className="text-sm">{columnLabel(key)}</span>
+                              <span className="text-body">{columnLabel(key)}</span>
                               <Switch size="sm" checked={!hiddenColumns.includes(key)} onCheckedChange={() => toggleColumn(key)} />
                             </label>
                           ))}
@@ -1152,32 +1153,55 @@ export function ProjectsPage() {
                   </PopoverContent>
                 </Popover>
 
-              {/* View toggle — a single button that flips table ⇄ cards.
-                  Pure presentation; coupled to nothing else. */}
-              <Tooltip>
-                <TooltipTrigger
-                  render={
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="h-8 w-8 gap-1 px-0 text-muted-foreground md:w-auto md:px-2.5"
-                      onClick={() => setViewMode(isCompact ? "comfortable" : "compact")}
-                    >
-                      {isCompact ? (
-                        <Rows3 className="size-3.5" />
-                      ) : (
-                        <LayoutGrid className="size-3.5" />
-                      )}
-                      <span className="hidden md:inline">
-                        {isCompact ? t(($) => $.page.view_table) : t(($) => $.page.view_cards)}
-                      </span>
-                    </Button>
-                  }
-                />
-                <TooltipContent side="bottom">
-                  {isCompact ? t(($) => $.page.view_cards) : t(($) => $.page.view_table)}
-                </TooltipContent>
-              </Tooltip>
+              {/* View selector — a dropdown menu to pick the list view,
+                  aligned with the issue list's view menu. The trigger shows
+                  the active view; the menu carries every mode so new views
+                  can be added as menu items. Pure presentation. */}
+              <DropdownMenu>
+                <Tooltip>
+                  <DropdownMenuTrigger
+                    render={
+                      <TooltipTrigger
+                        render={
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-8 w-8 gap-1 px-0 text-muted-foreground md:w-auto md:px-2.5"
+                          >
+                            {isCompact ? (
+                              <Rows3 className="size-3.5" />
+                            ) : (
+                              <LayoutGrid className="size-3.5" />
+                            )}
+                            <span className="hidden md:inline">
+                              {isCompact ? t(($) => $.page.view_table) : t(($) => $.page.view_cards)}
+                            </span>
+                          </Button>
+                        }
+                      />
+                    }
+                  />
+                  <TooltipContent side="bottom">{t(($) => $.toolbar.view)}</TooltipContent>
+                </Tooltip>
+                <DropdownMenuContent align="end" className="w-auto">
+                  <DropdownMenuGroup>
+                    <DropdownMenuLabel>{t(($) => $.toolbar.view)}</DropdownMenuLabel>
+                  </DropdownMenuGroup>
+                  <DropdownMenuRadioGroup
+                    value={viewMode}
+                    onValueChange={(v) => setViewMode(v as ProjectViewMode)}
+                  >
+                    <DropdownMenuRadioItem value="compact">
+                      <Rows3 />
+                      {t(($) => $.page.view_table)}
+                    </DropdownMenuRadioItem>
+                    <DropdownMenuRadioItem value="comfortable">
+                      <LayoutGrid />
+                      {t(($) => $.page.view_cards)}
+                    </DropdownMenuRadioItem>
+                  </DropdownMenuRadioGroup>
+                </DropdownMenuContent>
+              </DropdownMenu>
             </div>
           </div>
 
@@ -1187,7 +1211,7 @@ export function ProjectsPage() {
           ) : visible.length === 0 ? (
             <div className="flex flex-1 flex-col items-center justify-center py-24 text-muted-foreground">
               <Search className="mb-3 h-10 w-10 opacity-30" />
-              <p className="text-sm">{t(($) => $.page.no_matches)}</p>
+              <p className="text-body">{t(($) => $.page.no_matches)}</p>
             </div>
           ) : isCompact ? (
             <div className="min-h-0 flex-1 overflow-auto @container">

@@ -3,8 +3,10 @@
 package agent
 
 import (
+	"os"
 	"os/exec"
 	"syscall"
+	"time"
 )
 
 // createNewConsole allocates a fresh console for the child process. Combined
@@ -30,3 +32,25 @@ func hideAgentWindow(cmd *exec.Cmd) {
 	cmd.SysProcAttr.HideWindow = true
 	cmd.SysProcAttr.CreationFlags |= createNewConsole
 }
+
+// configureProcessGroup is a no-op on Windows: there is no Setpgid/process-group
+// signalling. Descendant cleanup relies on the hidden console group set up by
+// hideAgentWindow plus exec.CommandContext / WaitDelay terminating the child.
+func configureProcessGroup(cmd *exec.Cmd) {}
+
+// codexInitializeRetrySupported remains false until Codex children are owned
+// by a Job Object and descendant termination can be positively confirmed.
+func codexInitializeRetrySupported() bool { return false }
+
+// signalProcessGroup terminates the process on Windows. Windows has no
+// SIGTERM/SIGKILL distinction or process-group signalling, so the signal is
+// ignored and the process is killed directly (TerminateProcess via Kill). The
+// caller's grace window still applies before this is invoked with SIGKILL.
+func signalProcessGroup(p *os.Process, _ syscall.Signal) {
+	if p == nil {
+		return
+	}
+	_ = p.Kill()
+}
+
+func waitProcessGroupGone(_ *os.Process, _ time.Duration) bool { return false }
