@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -62,7 +61,7 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 		return nil, fmt.Errorf("openclaw executable not found at %q: %w", execPath, err)
 	}
 
-	if err := checkOpenclawVersion(ctx, execPath); err != nil {
+	if err := checkOpenclawVersion(ctx, b.cfg.commandAt(execPath)); err != nil {
 		return nil, err
 	}
 
@@ -75,9 +74,9 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	}
 	args := buildOpenclawArgs(prompt, sessionID, opts, b.cfg.Logger)
 
-	cmd := exec.CommandContext(runCtx, execPath, args...)
+	cmd := b.cfg.commandAt(execPath).exec(runCtx, args...)
 	hideAgentWindow(cmd)
-	b.cfg.Logger.Info("agent command", "exec", execPath, "args", args)
+	b.cfg.logAgentCommand(cmd, newAgentCommandLogArgs(args, trustAgentCommandPositional(0, "agent")))
 	// 500ms, matching cursor-agent — the other backend whose CLI can deliver a
 	// terminal result while keeping a process alive.
 	//
@@ -175,6 +174,12 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 			// Not folded into the cutShort case above: that path cancels on
 			// purpose, and a Cancel call makes Wait report the kill instead of
 			// ErrWaitDelay. This case is specifically the clean-exit one.
+			//
+			// Reword with care: this warning is the only observable proof that
+			// this branch ran, so TestOpenclawExecuteToleratesLingeringStderrHolder
+			// asserts on the "held a pipe past WaitDelay" fragment. That fragment
+			// straddles the concatenation below, so grepping the source for it
+			// finds nothing — hence this note.
 			b.cfg.Logger.Warn("openclaw exited cleanly but a descendant held a "+
 				"pipe past WaitDelay; delivering the parsed result and dropping "+
 				"the stderr tail", "pid", cmd.Process.Pid)
@@ -281,8 +286,8 @@ func customArgsContains(args []string, flag string) bool {
 // minOpenclawVersion. The returned error becomes the task's failure
 // comment, so the message intentionally names the detected version
 // and the upgrade command.
-func checkOpenclawVersion(ctx context.Context, execPath string) error {
-	cmd := exec.CommandContext(ctx, execPath, "--version")
+func checkOpenclawVersion(ctx context.Context, runtimeCmd Command) error {
+	cmd := runtimeCmd.exec(ctx, "--version")
 	hideAgentWindow(cmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -399,8 +404,7 @@ func (b *openclawBackend) processOutput(r io.Reader, ch chan<- Message) openclaw
 	// backend on this code path emits real NDJSON streams and needs live
 	// progress updates, we'll need to split the fast path off a streaming
 	// reader instead of io.ReadAll.
-	scanner := bufio.NewScanner(bytes.NewReader(buf))
-	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
+	scanner := newAgentStreamScanner(bytes.NewReader(buf))
 
 	var output strings.Builder
 	var sessionID string
