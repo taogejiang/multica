@@ -1,6 +1,6 @@
 ---
 name: sync_from_multica-ai
-description: "Use when the user wants to sync this fork from multica-ai/multica. Default to GitHub Sync fork for simple upstream sync. First verify fork relationship, target branch, and whether the request is only to absorb upstream main changes. Only fall back to local git merge/rebase when Sync fork cannot satisfy the request. Keywords: sync fork, fork sync, sync from upstream, multica-ai, forked repo sync, 同步 fork, 从上游同步, sync_from_multica-ai"
+description: "Use when the user wants to sync this fork from multica-ai/multica or review a previous upstream upgrade. Default to GitHub Sync fork for simple upstream sync. Verify fork relationship, target branch, and intent before using local merge/rebase. For every local sync, archive the feature summary, risks, validation, deployment status, and rollback plan under this skill directory. Keywords: sync fork, fork sync, sync from upstream, upgrade archive, risk assessment, multica-ai, 同步 fork, 从上游同步, 升级记录, 风险评估, sync_from_multica-ai"
 ---
 
 # Sync From multica-ai Skill
@@ -15,6 +15,7 @@ Default behavior:
 2. Verify which branch the user wants to sync
 3. If the goal is only to absorb upstream default branch updates into the fork default branch, recommend **GitHub `Sync fork`**
 4. Only use local git merge/rebase workflow when GitHub `Sync fork` is not sufficient
+5. For every local sync, create or update a persistent upgrade record under `upgrades/`
 
 This skill is intentionally biased toward not over-operating. If GitHub can do the sync directly, do not propose a heavier local upgrade workflow.
 
@@ -171,6 +172,38 @@ Conflict handling rules:
 - For local self-host patches, preserve local intent unless upstream change is clearly required
 - If conflicts are non-trivial, stop and report exact files plus resolution options
 
+### Fallback Phase C: Upgrade Archive
+
+After a local merge or rebase, create or update:
+
+```text
+.github/skills/sync_from_multica-ai/upgrades/README.md
+.github/skills/sync_from_multica-ai/upgrades/YYYY-MM-DD-upstream-main-<short-sha>.md
+```
+
+The dated record is mandatory even when merge and tests pass. It must contain:
+
+- Baseline, upstream, merge/result, target branch, and remote commit IDs
+- Upstream commit count, ahead/behind counts, diff shortstat, and top changed directories
+- User-visible features grouped by product domain
+- A subsystem impact matrix with risk level, behavior change, failure signal, and required check
+- Database migration range, migration file count, and destructive SQL operations
+- Local-only customization overlap and compatibility risks
+- Build/runtime toolchain and API/data contract changes
+- New or changed environment variables and private deployment configuration gaps
+- Validation commands and results
+- Push, build, database backup, deployment, and post-deploy status
+- Rollout acceptance checklist and rollback procedure
+
+Archive rules:
+
+- Mark unknown or unexecuted stages as `Pending`; never imply deployment happened from a successful source merge
+- Update the same record after push, build, migration, restart, rollback, or incident handling
+- Keep the archive index status synchronized with the dated record
+- Preserve prior records; never overwrite an older upgrade with a new sync
+- Do not include secrets, tokens, passwords, private keys, or unredacted environment values
+- If the change is GitHub-side `Sync fork` only, archive only when the user asks for tracking or when local deployment is affected
+
 ### Optional Deployment Phase
 
 Only run this if the user explicitly asks to rebuild or redeploy after sync.
@@ -189,6 +222,17 @@ docker-compose ps
 docker-compose build <services>
 docker-compose up -d <services>
 ```
+
+Before deployment:
+
+- Read the current dated upgrade record
+- Require a verified database backup when migrations are present
+- Record current image tags and service health for rollback
+
+After deployment:
+
+- Update the dated record with image digests, migration outcome, service state, and acceptance results
+- Update `upgrades/README.md` from `Pending` to the actual rollout status
 
 ## Reporting Format
 
@@ -217,6 +261,10 @@ Always provide results in these sections:
 - Conflict risk
 - Any follow-up checks
 
+6. "Upgrade Archive"
+- Path to the dated record for local workflows
+- Current archived rollout status
+
 ## Safety Rules
 
 - Default to the lightest valid sync path
@@ -224,6 +272,8 @@ Always provide results in these sections:
 - Do not build or redeploy just because code sync was discussed
 - Do not force-push any branch unless explicitly approved
 - If the request is only about GitHub-side fork sync, keep the answer short and operational
+- Never deploy a migration-bearing upgrade without first reporting backup and rollback requirements
+- Never leave a completed local sync documented only in chat; update the upgrade archive
 
 ## Example Use Cases
 
