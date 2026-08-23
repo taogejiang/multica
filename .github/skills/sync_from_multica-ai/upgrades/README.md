@@ -17,4 +17,4 @@ Each upgrade record should contain:
 
 | Date | Target | Upstream | Merge | Risk | Status | Record |
 | --- | --- | --- | --- | --- | --- | --- |
-| 2026-08-23 | `qaihub_multica` | `0716081bb` | `7446e2f35` | High | Merged locally; push and deployment pending | [2026-08-23-upstream-main-0716081bb.md](2026-08-23-upstream-main-0716081bb.md) |
+| 2026-08-23 | `qaihub_multica` | `0716081bb` | `7446e2f35` | High | Local services deployed; remote daemon and workflow acceptance pending | [2026-08-23-upstream-main-0716081bb.md](2026-08-23-upstream-main-0716081bb.md) |
