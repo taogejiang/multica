@@ -412,6 +412,26 @@ func TestBuildInvitationParams_ToAndFromPassedThrough(t *testing.T) {
 	}
 }
 
+func TestInvitationURL(t *testing.T) {
+	t.Run("prefers app URL and preserves its base path", func(t *testing.T) {
+		t.Setenv("MULTICA_APP_URL", "https://app.example.com/base/")
+		t.Setenv("FRONTEND_ORIGIN", "https://app.example.com")
+
+		if got := invitationURL("abc-123"); got != "https://app.example.com/base/invite/abc-123" {
+			t.Fatalf("invitationURL() = %q", got)
+		}
+	})
+
+	t.Run("falls back to frontend origin", func(t *testing.T) {
+		t.Setenv("MULTICA_APP_URL", "")
+		t.Setenv("FRONTEND_ORIGIN", "https://app.example.com/base/")
+
+		if got := invitationURL("abc-123"); got != "https://app.example.com/base/invite/abc-123" {
+			t.Fatalf("invitationURL() = %q", got)
+		}
+	})
+}
+
 // --- loginAuth.Start security tests ---
 
 func TestLoginAuth_Start_RefusesUnencryptedRemote(t *testing.T) {

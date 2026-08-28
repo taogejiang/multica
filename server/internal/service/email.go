@@ -366,11 +366,7 @@ func (s *EmailService) SendVerificationCode(to, code string) error {
 // SendInvitationEmail notifies the invitee that they have been invited to a workspace.
 // invitationID is included in the URL so the email deep-links to /invite/{id}.
 func (s *EmailService) SendInvitationEmail(to, inviterName, workspaceName, invitationID string) error {
-	appURL := strings.TrimSpace(os.Getenv("FRONTEND_ORIGIN"))
-	if appURL == "" {
-		appURL = "https://multica.ai"
-	}
-	inviteURL := fmt.Sprintf("%s/invite/%s", appURL, invitationID)
+	inviteURL := invitationURL(invitationID)
 
 	if s.smtpHost != "" {
 		params := buildInvitationParams(s.fromEmail, to, inviterName, workspaceName, inviteURL)
@@ -383,6 +379,17 @@ func (s *EmailService) SendInvitationEmail(to, inviterName, workspaceName, invit
 	params := buildInvitationParams(s.fromEmail, to, inviterName, workspaceName, inviteURL)
 	_, err := s.client.Emails.Send(params)
 	return err
+}
+
+func invitationURL(invitationID string) string {
+	appURL := strings.TrimSpace(os.Getenv("MULTICA_APP_URL"))
+	if appURL == "" {
+		appURL = strings.TrimSpace(os.Getenv("FRONTEND_ORIGIN"))
+	}
+	if appURL == "" {
+		appURL = "https://multica.ai"
+	}
+	return fmt.Sprintf("%s/invite/%s", strings.TrimRight(appURL, "/"), invitationID)
 }
 
 // buildInvitationParams assembles the email request for an invitation.

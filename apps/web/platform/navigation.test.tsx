@@ -22,7 +22,7 @@ vi.mock("next/navigation", () => ({
   useSearchParams: () => new URLSearchParams(),
 }));
 
-import { WebNavigationProvider } from "./navigation";
+import { getPublicAppUrl, WebNavigationProvider } from "./navigation";
 import { useNavigation, type NavigationAdapter } from "@multica/views/navigation";
 
 function navigate(path: string) {
@@ -75,6 +75,38 @@ describe("WebNavigationProvider internal link bridge", () => {
     navigate("/acme/issues/MUL-1");
 
     expect(router.push).not.toHaveBeenCalled();
+  });
+
+  it("opens modifier-click navigation against the public app base path", () => {
+    const open = vi.spyOn(window, "open").mockImplementation(() => null);
+    render(<WebNavigationProvider>{null}</WebNavigationProvider>);
+
+    window.dispatchEvent(
+      new CustomEvent("multica:navigate", {
+        detail: {
+          path: "/acme/issues/MUL-1",
+          disposition: "background-tab",
+        },
+      }),
+    );
+
+    expect(open).toHaveBeenCalledWith(
+      "http://localhost:3000/acme/issues/MUL-1",
+      "_blank",
+      "noopener,noreferrer",
+    );
+  });
+});
+
+describe("getPublicAppUrl", () => {
+  it("preserves the configured app base path", () => {
+    expect(
+      getPublicAppUrl(
+        "/devops/issues/DEV-1",
+        "https://app.example.com",
+        "/multica",
+      ),
+    ).toBe("https://app.example.com/multica/devops/issues/DEV-1");
   });
 });
 

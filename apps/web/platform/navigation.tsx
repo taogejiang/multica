@@ -8,6 +8,17 @@ import {
 } from "@multica/views/navigation";
 import { canGoBackInApp } from "./in-app-history";
 
+const appBasePath = process.env.NEXT_PUBLIC_APP_BASE_PATH ?? "";
+
+export function getPublicAppUrl(
+  path: string,
+  origin = window.location.origin,
+  basePath = appBasePath,
+) {
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  return `${origin}${basePath}${normalizedPath}`;
+}
+
 /**
  * Web half of the `multica:navigate` bridge — the event shared content
  * (comments, chat, issue descriptions) fires when a link resolves to an in-app
@@ -30,11 +41,7 @@ function useInternalLinkHandler(router: ReturnType<typeof useRouter>) {
         detail?.disposition === "background-tab" ||
         detail?.disposition === "foreground-tab"
       ) {
-        window.open(
-          window.location.origin + path,
-          "_blank",
-          "noopener,noreferrer",
-        );
+        window.open(getPublicAppUrl(path), "_blank", "noopener,noreferrer");
         return;
       }
       router.push(path);
@@ -63,7 +70,7 @@ function NavigationProviderInner({
     pathname,
     searchParams: new URLSearchParams(searchParams.toString()),
     getShareableUrl: (path: string) =>
-      typeof window === "undefined" ? path : window.location.origin + path,
+      typeof window === "undefined" ? path : getPublicAppUrl(path),
     // router.prefetch is a no-op in dev mode by Next.js design; in production
     // it warms the RSC payload + route chunk so the next push() commits with
     // no network round-trip. Safe to call repeatedly — Next dedupes internally.
