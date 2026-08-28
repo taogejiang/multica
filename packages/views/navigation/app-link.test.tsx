@@ -28,6 +28,21 @@ function renderLink(
 }
 
 describe("AppLink", () => {
+  it("renders the platform href while keeping navigation on the internal path", () => {
+    const push = vi.fn();
+    const adapter = makeAdapter({
+      push,
+      getHref: (path) => `/multica${path}`,
+    });
+
+    renderLink(adapter, { href: "/devops/issues" });
+
+    const link = screen.getByRole("link", { name: "go" });
+    expect(link).toHaveAttribute("href", "/multica/devops/issues");
+    fireEvent.click(link);
+    expect(push).toHaveBeenCalledWith("/devops/issues");
+  });
+
   it("calls caller onClick BEFORE push so synchronous side effects (close menu, etc) commit before the transition starts", () => {
     const order: string[] = [];
     const adapter = makeAdapter({

@@ -69,6 +69,7 @@ function NavigationProviderInner({
     canGoBack: canGoBackInApp,
     pathname,
     searchParams: new URLSearchParams(searchParams.toString()),
+    getHref: (path: string) => `${appBasePath}${path}`,
     getShareableUrl: (path: string) =>
       typeof window === "undefined" ? path : getPublicAppUrl(path),
     // router.prefetch is a no-op in dev mode by Next.js design; in production

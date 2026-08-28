@@ -18,6 +18,8 @@ export interface NavigationAdapter {
     title?: string,
     opts?: { activate?: boolean },
   ) => void;
+  /** Return the native anchor href for an internal path. Web adds its deployment base path; desktop leaves this unset. */
+  getHref?: (path: string) => string;
   /** Return a shareable URL for a path. Web: origin + path. Desktop: public web URL of the connected environment. */
   getShareableUrl: (path: string) => string;
   /**
