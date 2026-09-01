@@ -22,7 +22,6 @@ import (
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/daemonws"
-	"github.com/multica-ai/multica/server/internal/entitlement"
 	"github.com/multica-ai/multica/server/internal/integrations/slack"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
@@ -86,7 +85,7 @@ func (h *Handler) requireDaemonRuntimeAccess(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		return db.AgentRuntime{}, false
 	}
-	rt, err := h.Queries.GetAgentRuntime(r.Context(), runtimeUUID)
+	rt, err := h.getAgentRuntime(r.Context(), obsmetrics.RuntimeLookupSourceDaemonAPI, runtimeUUID)
 	if err != nil {
 		if isNotFound(err) {
 			writeError(w, http.StatusNotFound, "runtime not found")
@@ -943,7 +942,7 @@ func (h *Handler) DaemonDeregister(w http.ResponseWriter, r *http.Request) {
 
 	for i, rid := range req.RuntimeIDs {
 		// Look up the runtime and verify ownership.
-		rt, err := h.Queries.GetAgentRuntime(r.Context(), runtimeUUIDs[i])
+		rt, err := h.getAgentRuntime(r.Context(), obsmetrics.RuntimeLookupSourceDaemonAPI, runtimeUUIDs[i])
 		if err != nil {
 			slog.Warn("deregister: runtime not found", "runtime_id", rid, "error", err)
 			continue
@@ -1088,7 +1087,7 @@ func (h *Handler) DaemonHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	lookupStart := time.Now()
-	rt, lookupErr := h.Queries.GetAgentRuntime(r.Context(), runtimeUUID)
+	rt, lookupErr := h.getAgentRuntime(r.Context(), obsmetrics.RuntimeLookupSourceHeartbeatHTTP, runtimeUUID)
 	runtimeLookupMs = time.Since(lookupStart).Milliseconds()
 	if lookupErr != nil {
 		// Only pgx.ErrNoRows means the runtime row is gone. Daemon reads this
@@ -1173,7 +1172,7 @@ func (h *Handler) HandleDaemonWSHeartbeat(ctx context.Context, identity daemonws
 	if err != nil {
 		return nil, fmt.Errorf("invalid runtime_id: %w", err)
 	}
-	rt, err := h.Queries.GetAgentRuntime(ctx, runtimeUUID)
+	rt, err := h.getAgentRuntime(ctx, obsmetrics.RuntimeLookupSourceHeartbeatWS, runtimeUUID)
 	if err != nil {
 		if isNotFound(err) {
 			return &protocol.DaemonHeartbeatAckPayload{
@@ -1707,8 +1706,8 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 		resp, deliveredCommentIDs, _, _, failure := h.buildClaimedTaskResponse(r, &task, rt, uuidToString(task.RuntimeID), rtWorkspaceID)
 		if failure != nil {
 			// Builder rejected this task (workspace isolation / chat-input);
-			// it has already cancelled the task where the failure requires it.
-			// Skip it — non-cancelling failures leave the task dispatched for
+			// it has already settled the task where the failure requires it.
+			// Skip it — non-settling failures leave the task dispatched for
 			// the reclaim path.
 			continue
 		}
@@ -1835,6 +1834,28 @@ func (h *Handler) rejectClaimSourceLoad(ctx context.Context, task *db.AgentTaskQ
 		outcome: "error_source_load",
 		status:  http.StatusInternalServerError,
 		message: fmt.Sprintf("failed to load task %s", source),
+	}
+}
+
+// rejectClaimSkillLoad settles a claim whose agent skills could not be read.
+// It mirrors rejectClaimSourceLoad's transient branch — preserve the
+// just-dispatched task so the stale-dispatched reclaim redelivers it — because
+// this is the same kind of failure: a transient read on the claim-build path.
+//
+// Dispatching with whatever loaded is not the safer half-measure it looks
+// like. LoadAgentSkills reads the whole skill set in two queries, so a failure
+// means every skill loses its supporting files or the agent loses every skill,
+// and the ref hashes sent to the daemon are computed over that same truncated
+// content — so the daemon validates the bundle, caches it, and the agent runs
+// with rules silently missing. There is no ErrNoRows branch to mirror: an
+// agent with no skills is a legitimate empty result, not a missing row.
+func (h *Handler) rejectClaimSkillLoad(task *db.AgentTaskQueue, err error) *claimBuildFailure {
+	slog.Error("task claim: agent skill load failed; preserving task for redelivery",
+		"task_id", uuidToString(task.ID), "agent_id", uuidToString(task.AgentID), "error", err)
+	return &claimBuildFailure{
+		outcome: "error_skill_load",
+		status:  http.StatusInternalServerError,
+		message: "failed to load agent skills",
 	}
 }
 
@@ -1979,36 +2000,7 @@ func claimResponseAgentIdentityMatches(resp AgentTaskResponse) bool {
 func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQueue, runtime db.AgentRuntime, runtimeID, runtimeWorkspaceID string) (resp AgentTaskResponse, deliveredCommentIDs []pgtype.UUID, agentSkillCount, builtinSkillCount int, failure *claimBuildFailure) {
 	// Build response with fresh agent data (name + skills + custom_env + custom_args).
 	resp = taskToResponse(*task, runtimeWorkspaceID)
-	if task.IssueID.Valid {
-		if policy, enabled := h.issueWindowPolicy(r.Context(), runtime.WorkspaceID); enabled {
-			visible, visibilityErr := h.issueIDsWithinWindow(r.Context(), runtime.WorkspaceID, policy, []pgtype.UUID{task.IssueID})
-			if visibilityErr != nil {
-				h.recordIssueWindow(policy.action, "agent_context", "error")
-				if policy.action == entitlement.ActionEnforce {
-					if _, requeueErr := h.TaskService.RequeueTaskAfterClaimFailure(r.Context(), *task); requeueErr != nil {
-						slog.Error("task claim: requeue after issue window failure failed", "task_id", uuidToString(task.ID), "error", requeueErr)
-					}
-					return resp, nil, 0, 0, &claimBuildFailure{
-						outcome: "error_issue_window_check", status: http.StatusInternalServerError, message: "failed to check issue access",
-					}
-				}
-			} else if !visible {
-				if policy.action == entitlement.ActionObserve {
-					h.recordIssueWindow(policy.action, "agent_context", "would_block")
-				} else {
-					h.recordIssueWindow(policy.action, "agent_context", "blocked")
-					return resp, nil, 0, 0, h.failClaimedTaskBeforeLaunch(
-						r.Context(), task,
-						"This issue is outside the workspace's recently created issue window.",
-						taskfailure.ReasonIssueWindowRestricted,
-						"error_issue_window_restricted", http.StatusPaymentRequired, "issue is outside the recently created window",
-					)
-				}
-			} else {
-				h.recordIssueWindow(policy.action, "agent_context", "allowed")
-			}
-		}
-	}
+	var issueNumber int32
 	// Claim-only capability: this server resolves the squad-leader role on the
 	// wire (is_leader_task / squad_id), so the daemon must not re-derive it
 	// from the briefing text. Set unconditionally — on every claim, leader or
@@ -2071,6 +2063,43 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 			status:  http.StatusInternalServerError,
 			message: "failed to load task agent",
 		}
+	}
+	// The SQL claim narrows candidates and repeats the access predicate before
+	// changing task state, but Agent mutations do not stay locked through HTTP
+	// response assembly. Recheck the freshly loaded Agent here so a rebind or
+	// owner change that committed after the claim cannot reach the daemon.
+	if agent.RuntimeID != task.RuntimeID {
+		slog.Warn("daemon claim: agent runtime changed before delivery; refusing dispatch",
+			"task_id", uuidToString(task.ID),
+			"agent_id", uuidToString(task.AgentID),
+			"task_runtime_id", uuidToString(task.RuntimeID),
+			"agent_runtime_id", uuidToString(agent.RuntimeID),
+		)
+		return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, h.failClaimedTaskBeforeLaunch(
+			r.Context(), task,
+			"The agent moved to another runtime before this task could start. Retry the task to run it on the agent's current runtime.",
+			taskfailure.ReasonInvalidTaskIdentity,
+			"error_agent_runtime_changed", http.StatusConflict, "agent runtime changed before task delivery",
+		)
+	}
+	if runtime.Visibility == "private" && runtime.OwnerID.Valid &&
+		(!agent.OwnerID.Valid || agent.OwnerID != runtime.OwnerID) {
+		userMessage := "This private runtime cannot run the assigned agent because the agent and runtime have different owners."
+		if !agent.OwnerID.Valid {
+			userMessage = "This private runtime cannot run the assigned agent because the agent has no owner."
+		}
+		slog.Warn("daemon claim: private runtime no longer permits task agent; refusing dispatch",
+			"task_id", uuidToString(task.ID),
+			"agent_id", uuidToString(task.AgentID),
+			"runtime_id", runtimeID,
+			"agent_owner_valid", agent.OwnerID.Valid,
+		)
+		return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, h.failClaimedTaskBeforeLaunch(
+			r.Context(), task,
+			userMessage,
+			taskfailure.ReasonInvalidTaskIdentity,
+			"error_runtime_access_denied", http.StatusForbidden, "private runtime does not permit task agent",
+		)
 	}
 	useSkillRefs := requestHasClientCapability(r, protocol.DaemonCapabilitySkillBundlesV1)
 	var customEnv map[string]string
@@ -2158,11 +2187,17 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		resp.Agent.Instructions = service.ComposeMikaInstructions(agent.Name, agent.Instructions)
 	}
 	if useSkillRefs {
-		_, skillRefs := h.TaskService.LoadAgentSkillBundles(r.Context(), task.AgentID)
+		_, skillRefs, err := h.TaskService.LoadAgentSkillBundles(r.Context(), task.AgentID)
+		if err != nil {
+			return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, h.rejectClaimSkillLoad(task, err)
+		}
 		agentSkillCount = len(skillRefs)
 		resp.Agent.SkillRefs = skillRefs
 	} else {
-		skills := h.TaskService.LoadAgentSkills(r.Context(), task.AgentID)
+		skills, err := h.TaskService.LoadAgentSkills(r.Context(), task.AgentID)
+		if err != nil {
+			return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, h.rejectClaimSkillLoad(task, err)
+		}
 		agentSkillCount = len(skills)
 		builtinSkills := h.TaskService.BuiltinSkills()
 		builtinSkillCount = len(builtinSkills)
@@ -2233,6 +2268,7 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 			return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, failure
 		}
 		resp.ThreadName = issue.Title
+		issueNumber = issue.Number
 
 		// Squad-leader briefing injection: keyed off the task being a
 		// leader-task (is_leader_task) carrying a squad_id — NOT off the
@@ -2595,52 +2631,23 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 				resp.ChatIntro = !hasUser
 			}
 		}
-		// Flag a channel-backed session so the daemon makes the agent aware it
-		// is operating inside an IM conversation and not the Multica web app
-		// (MUL-3871). Empty for a web-only chat session.
-		//
-		// The binding is read WITHOUT naming a channel. Every channel writes
-		// the same channel_chat_session_binding row and differs only in
-		// channel_type, and UNIQUE (chat_session_id) allows at most one, so
-		// the row itself is the answer. Enumerating candidate channels here
-		// was the bug twice over: the Slack-only lookup reported a Feishu
-		// chat as web-backed (MUL-4899), and the {slack, feishu} list that
-		// replaced it did the same to WeCom. Downstream that mis-flag makes
-		// the brief inject `multica attachment upload` guidance into a
-		// conversation that cannot carry attachments at all.
-		//
-		// ChatInThread stays Slack-only on purpose. It selects between
-		// `multica chat history` and `multica chat thread`, and those two
-		// endpoints are hardwired to h.SlackHistory (chat_history.go) — there
-		// is no history reader on any other channel, so the flag has nothing
-		// to select between there and must not imply one exists.
-		//
-		// chat_type rides along on the same row. It is what lets the
-		// per-turn prompt tell the agent whether this chat_session is a room
-		// shared by many people or a 1:1 with the bot; the prompt used to
-		// describe every chat run as a private 1:1 whatever the room. The
-		// shared session service writes the column for every channel
-		// (channel/engine/session.go), so no channel needs naming here
-		// either.
-		if binding, berr := h.Queries.GetChannelChatSessionBindingBySessionAny(r.Context(), cs.ID); berr == nil {
-			resp.ChatChannelType = binding.ChannelType
-			resp.ChatType = binding.ChatType
-			// Whether a file the agent produces reaches this
-			// conversation is the server's question, not the daemon's.
-			// It takes an adapter that goes back for the bound
-			// attachment AND storage for it to go back to, and only
-			// this process knows both. Answered here so the daemon
-			// never has to infer it from the channel type — an
-			// inference that promises delivery on any deployment
-			// running WeCom without object storage.
-			resp.ChatChannelDeliversFiles = h.channelDeliversFiles(binding.ChannelType)
-			if binding.ChannelType == string(slack.TypeSlack) {
-				// The latest trigger was a thread reply iff its reply-target
-				// thread (last_thread_id) differs from its own message id (a
-				// top-level @mention records its own ts as both).
-				resp.ChatInThread = binding.LastThreadID.Valid && binding.LastThreadID.String != "" &&
-					binding.LastThreadID.String != binding.LastMessageID.String
+		// A task-level delivery snapshot, not the Chat's historical binding,
+		// decides whether this run is operating for an external audience.
+		// Web/Desktop/Mobile turns in an old channel-originated Chat have no
+		// snapshot and remain private to Multica after /new rotates the route.
+		delivery, deliveryErr := h.Queries.GetChannelTaskDelivery(r.Context(), task.ID)
+		if deliveryErr == nil {
+			resp.ChatChannelType = delivery.ChannelType
+			resp.ChatType = delivery.ChatType
+			resp.ChatChannelDeliversFiles = h.channelDeliversFiles(delivery.ChannelType)
+			if delivery.ChannelType == string(slack.TypeSlack) {
+				resp.ChatInThread = delivery.ChannelThreadID.Valid &&
+					delivery.ChannelThreadID.String != "" &&
+					delivery.ChannelThreadID.String != delivery.ChannelMessageID.String
 			}
+		} else if !errors.Is(deliveryErr, pgx.ErrNoRows) {
+			return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount,
+				h.rejectClaimSourceLoad(r.Context(), task, deliveryErr, "channel task delivery", uuidToString(task.ID))
 		}
 		// A web chat can opt into the same durable project context as an
 		// issue-bound task.
@@ -2894,7 +2901,36 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 			if failure := h.rejectClaimOnWorkspaceMismatch(r.Context(), task, resp.WorkspaceID, runtimeID, runtimeWorkspaceID, true); failure != nil {
 				return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, failure
 			}
-
+			if qc.SourceContextID != "" {
+				workspaceID, workspaceErr := util.ParseUUID(qc.WorkspaceID)
+				contextID, contextIDErr := util.ParseUUID(qc.SourceContextID)
+				if workspaceErr != nil || contextIDErr != nil {
+					return resp, nil, 0, 0, h.failClaimedTaskBeforeLaunch(
+						r.Context(), task,
+						"Captured source context is invalid. Start again from the branch point.",
+						taskfailure.ReasonAgentUnknown,
+						"error_source_context_invalid", http.StatusConflict, "captured source context is invalid",
+					)
+				}
+				captured, contextErr := h.Queries.GetIssueSourceContextByID(r.Context(), db.GetIssueSourceContextByIDParams{WorkspaceID: workspaceID, ID: contextID})
+				if contextErr != nil && !errors.Is(contextErr, pgx.ErrNoRows) {
+					if _, requeueErr := h.TaskService.RequeueTaskAfterClaimFailure(r.Context(), *task); requeueErr != nil {
+						slog.Error("quick-create claim: requeue after source context lookup failed", "task_id", uuidToString(task.ID), "error", requeueErr)
+					}
+					return resp, nil, 0, 0, &claimBuildFailure{
+						outcome: "error_source_context_load", status: http.StatusInternalServerError, message: "failed to load captured source context",
+					}
+				}
+				if contextErr != nil || captured.State != "pending" || captured.OriginTaskID != task.ID {
+					return resp, nil, 0, 0, h.failClaimedTaskBeforeLaunch(
+						r.Context(), task,
+						"Captured source context is no longer available. Start again from the branch point.",
+						taskfailure.ReasonAgentUnknown,
+						"error_source_context_unavailable", http.StatusConflict, "captured source context is unavailable",
+					)
+				}
+				resp.QuickCreateSourceContext = append(json.RawMessage(nil), captured.Snapshot...)
+			}
 			// When the user picked a project in the modal, surface its title
 			// and resources to the daemon so the agent has the same context
 			// it would for an issue-bound task. A prompt-supplied project id
@@ -2929,7 +2965,7 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 			// will fail loud, which is a better outcome than silently
 			// dropping the sub-issue intent.
 			if qc.ParentIssueID != "" {
-				resp.ParentIssueID = qc.ParentIssueID
+				parentExists := true
 				if parentUUID, err := util.ParseUUID(qc.ParentIssueID); err == nil {
 					if wsUUID, wsErr := util.ParseUUID(qc.WorkspaceID); wsErr == nil {
 						parent, perr := h.Queries.GetIssueInWorkspace(r.Context(), db.GetIssueInWorkspaceParams{
@@ -2940,8 +2976,20 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 							if ws, werr := h.Queries.GetWorkspace(r.Context(), wsUUID); werr == nil {
 								resp.ParentIssueIdentifier = ws.IssuePrefix + "-" + strconv.Itoa(int(parent.Number))
 							}
+						} else if qc.SourceContextID != "" && errors.Is(perr, pgx.ErrNoRows) {
+							// A contextual quick-create already owns an immutable
+							// snapshot. If its source was deleted before this first
+							// issue exists, create the eventual target as top-level —
+							// the same state application-layer detach would have
+							// produced had deletion happened just after creation.
+							// Ordinary Add sub-issue keeps its historical fail-loud
+							// behavior when its parent disappears.
+							parentExists = false
 						}
 					}
+				}
+				if parentExists {
+					resp.ParentIssueID = qc.ParentIssueID
 				}
 			}
 
@@ -3032,6 +3080,10 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 	// shared context. Empty string when the owner hasn't set one; the daemon
 	// skips rendering the heading in that case.
 	if ws, err := h.Queries.GetWorkspace(r.Context(), parseUUID(resp.WorkspaceID)); err == nil {
+		resp.WorkspaceSlug = ws.Slug
+		if issueNumber > 0 {
+			resp.IssueIdentifier = service.IssueIdentifier(ws.IssuePrefix, issueNumber)
+		}
 		if ws.Context.Valid {
 			resp.WorkspaceContext = ws.Context.String
 		}
@@ -3044,12 +3096,9 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 	}
 
 	// Workspace status catalog (MUL-6460): active CUSTOM statuses only, so the
-	// daemon can render them into the brief's status-command line. Not gated on
-	// the custom_issue_statuses flag — the flag only guards creation, and a
-	// catalog written before a flag flip must stay visible to agents as long as
-	// issues can sit on it. Read on every claim, like the agent row, so an
-	// admin's edit lands on the next task. Failure degrades to the built-in-only
-	// brief rather than failing the claim.
+	// daemon can render them into the brief's status-command line. Read on every
+	// claim, like the agent row, so an admin's edit lands on the next task.
+	// Failure degrades to the built-in-only brief rather than failing the claim.
 	if entries, err := h.Queries.ListIssueStatusEntries(r.Context(), db.ListIssueStatusEntriesParams{
 		WorkspaceID:     parseUUID(resp.WorkspaceID),
 		IncludeArchived: false,
@@ -3399,19 +3448,35 @@ func (h *Handler) ResolveTaskSkillBundles(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	bundles, _ := h.TaskService.LoadAgentSkillBundles(r.Context(), task.AgentID)
-	allowed := make(map[string]service.AgentSkillData, len(bundles))
-	for _, bundle := range bundles {
-		allowed[bundle.Source+"\x00"+bundle.ID] = bundle
-	}
-
-	resolved := make([]service.AgentSkillData, 0, len(req.Skills))
+	// Validate before reading: a malformed ref is rejected the same way it
+	// always was, now without paying for a load first.
+	wanted := make([]service.AgentSkillBundleRef, 0, len(req.Skills))
 	for _, ref := range req.Skills {
 		if ref.ID == "" || ref.Source == "" || ref.Hash == "" {
 			writeError(w, http.StatusBadRequest, "invalid skill ref")
 			return
 		}
-		bundle, ok := allowed[ref.Source+"\x00"+ref.ID]
+		wanted = append(wanted, service.AgentSkillBundleRef{ID: ref.ID, Source: ref.Source})
+	}
+
+	// Load ONLY what was asked for. The daemon resolves one skill per request,
+	// so serving these out of the agent's full bundle set meant reading and
+	// hashing every skill the agent has, once per request, to return one of
+	// them — quadratic in skill count across a cold dispatch.
+	allowed, err := h.TaskService.LoadRequestedAgentSkillBundles(r.Context(), task.AgentID, wanted)
+	if err != nil {
+		// 5xx, not a partial answer: the daemon's resolve retry can recover a
+		// transient read, and a bundle assembled from a failed read would pass
+		// its client-side validation and be cached as if it were complete.
+		slog.Error("resolve skill bundles: load agent skills failed",
+			"task_id", uuidToString(task.ID), "agent_id", uuidToString(task.AgentID), "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to load skill bundles")
+		return
+	}
+
+	resolved := make([]service.AgentSkillData, 0, len(req.Skills))
+	for _, ref := range req.Skills {
+		bundle, ok := allowed[service.AgentSkillBundleKey(ref.Source, ref.ID)]
 		if !ok {
 			writeError(w, http.StatusNotFound, "skill bundle not found")
 			return
@@ -4299,7 +4364,7 @@ func (h *Handler) ReportTaskUsage(w http.ResponseWriter, r *http.Request) {
 		provider := normalizeProvider(u.Provider)
 		if provider == "" {
 			if !runtimeProviderLoaded {
-				if rt, err := h.Queries.GetAgentRuntime(r.Context(), task.RuntimeID); err == nil {
+				if rt, err := h.getAgentRuntime(r.Context(), obsmetrics.RuntimeLookupSourceTask, task.RuntimeID); err == nil {
 					runtimeProvider = normalizeProvider(rt.Provider)
 				} else {
 					slog.Warn("load runtime provider for usage backfill failed",

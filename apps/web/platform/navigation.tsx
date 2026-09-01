@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useEffect } from "react";
+import { Suspense, useEffect, useSyncExternalStore } from "react";
 import { useRouter, usePathname, useSearchParams } from "next/navigation";
 import {
   NavigationProvider,
@@ -51,6 +51,22 @@ function useInternalLinkHandler(router: ReturnType<typeof useRouter>) {
   }, [router]);
 }
 
+/**
+ * The fragment is client-only state Next.js never surfaces: `usePathname()`
+ * drops it, and a `router.replace("/x#y")` mutates `window.location` without
+ * a render of its own. Reading it through an external store re-reads the URL
+ * on every render and re-renders on the events that change it behind React's
+ * back, so `adapter.hash` is never a stale copy.
+ */
+function subscribeToHash(onStoreChange: () => void): () => void {
+  window.addEventListener("hashchange", onStoreChange);
+  window.addEventListener("popstate", onStoreChange);
+  return () => {
+    window.removeEventListener("hashchange", onStoreChange);
+    window.removeEventListener("popstate", onStoreChange);
+  };
+}
+
 function NavigationProviderInner({
   children,
 }: {
@@ -59,6 +75,11 @@ function NavigationProviderInner({
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
+  const hash = useSyncExternalStore(
+    subscribeToHash,
+    () => window.location.hash,
+    () => "",
+  );
   useInternalLinkHandler(router);
 
   const adapter: NavigationAdapter = {
@@ -69,6 +90,7 @@ function NavigationProviderInner({
     canGoBack: canGoBackInApp,
     pathname,
     searchParams: new URLSearchParams(searchParams.toString()),
+    hash,
     getHref: (path: string) => `${appBasePath}${path}`,
     getShareableUrl: (path: string) =>
       typeof window === "undefined" ? path : getPublicAppUrl(path),

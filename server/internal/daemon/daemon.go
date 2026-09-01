@@ -8,6 +8,7 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -84,6 +85,17 @@ const (
 	// pendingWorkHintBookkeepingTTL is how long a runtime's last-hint timestamp
 	// is retained before it is swept — purely to keep the map bounded.
 	pendingWorkHintBookkeepingTTL = 10 * time.Minute
+	// idleWatchdogMaxTick caps the idle watchdog's polling interval. At the
+	// base rate of window/2 the overshoot scales with the budget: a 2h window
+	// would only be checked hourly, so a genuinely stuck run could hold its
+	// slot for 3h. The cap makes worst-case detection window + 5m no matter how
+	// large an operator sets the budget.
+	//
+	// 5m is chosen as the largest overshoot worth tolerating on top of a budget
+	// already measured in hours, not for its polling cost — a tick is an atomic
+	// load and a channel length check, so it is free at any interval anyone
+	// would pick.
+	idleWatchdogMaxTick = 5 * time.Minute
 )
 
 // pendingWorkHintMinInterval is the floor between two hint-driven heartbeats
@@ -1961,7 +1973,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 		"heartbeat_interval", d.cfg.HeartbeatInterval,
 		"agent_timeout", d.cfg.AgentTimeout,
 		"idle_watchdog", d.cfg.AgentIdleWatchdog,
+		// Logged explicitly because it is normally derived from idle_watchdog:
+		// without it an operator cannot read the tool budget actually in effect.
+		"tool_watchdog", d.cfg.AgentToolWatchdog,
 		"opencode_idle_watchdog", d.cfg.OpenCodeIdleWatchdog,
+		// Derived from the watchdog budget too (Codex's own timer is not
+		// tool-aware), so it needs the same treatment as tool_watchdog: without
+		// it the effective Codex budget is invisible until a timeout fires.
+		"codex_semantic_inactivity", d.cfg.CodexSemanticInactivityTimeout,
 		"max_concurrent_tasks", d.cfg.MaxConcurrentTasks,
 		"gc_enabled", d.cfg.GCEnabled,
 		"auto_update", d.cfg.AutoUpdateEnabled,
@@ -2625,7 +2644,8 @@ func (d *Daemon) registerRuntimesForWorkspaceBatchLocked(ctx context.Context, wo
 	// this host (MUL-3284). This is best-effort: a fetch error (e.g. an older
 	// server returning 404) must never fail registration — the daemon simply
 	// continues with the built-in runtimes it already collected. A profile
-	// whose command_name is not on PATH is skipped (the host doesn't have it).
+	// whose command_name is neither on PATH nor already discovered for the same
+	// protocol family is skipped (the host doesn't have it).
 	//
 	// profileSig is a content hash of the workspace's profile list captured
 	// here so an on-demand server notification can skip re-registration when
@@ -2714,14 +2734,14 @@ func (d *Daemon) registerBuiltinRuntimesForWorkspaceLocked(ctx context.Context, 
 
 // appendProfileRuntimes fetches the workspace's enabled custom runtime
 // profiles (MUL-3284) and appends a runtime registration entry for each one
-// whose command_name resolves on this host's PATH. For each resolved profile
+// whose command_name resolves on this host. For each resolved profile
 // it records the absolute command path and fixed args keyed by profile_id (via
 // recordProfileLaunch) so runTask can later launch the custom executable for a
 // claimed task.
 //
 // Best-effort by contract: any error fetching profiles (older server, network
 // blip) is logged and swallowed — registration proceeds with the built-in
-// runtimes already collected. A profile whose command is not on PATH is
+// runtimes already collected. A profile whose command cannot be resolved is
 // skipped with an Info log (this host simply doesn't have that command).
 //
 // The registration entry mirrors the built-in shape: name = display_name
@@ -2776,9 +2796,11 @@ func (d *Daemon) appendProfileRuntimes(ctx context.Context, workspaceID string, 
 		// that isn't on the daemon's PATH, or selects between multiple
 		// installs on the same host. A configured-but-unusable override
 		// (deleted/moved/non-executable) is logged and falls back to PATH
-		// rather than registering a runtime that can't launch. When neither
-		// the override nor PATH resolves, the profile is skipped (existing
-		// behavior).
+		// and then to the matching provider command already discovered at
+		// daemon startup. The latter matters for GUI-launched daemons whose
+		// environment cannot resolve a CLI directly even though built-in
+		// discovery found it through a login shell or provider install path.
+		// When none of those sources resolves, the profile is skipped.
 		var resolved string
 		var failureReason string
 		if override := strings.TrimSpace(d.cfg.ProfileCommandOverrides[profile.ID]); override != "" {
@@ -2796,23 +2818,31 @@ func (d *Daemon) appendProfileRuntimes(ctx context.Context, workspaceID string, 
 		if resolved == "" {
 			r, err := lookPath(profile.CommandName)
 			if err != nil {
-				// Host doesn't have this command — expected on hosts that aren't
-				// provisioned for this profile. Skip without failing.
-				d.logger.Info("skip custom runtime profile: command not found on PATH",
-					"workspace_id", workspaceID, "profile_id", profile.ID,
-					"command_name", profile.CommandName, "error", err)
-				if failureReason != "" {
-					failureReason += "; "
+				if discovered, ok := d.agents()[profile.ProtocolFamily]; ok && discovered.Command == profile.CommandName && discovered.Path != "" {
+					resolved = discovered.Path
+					d.logger.Info("custom runtime profile: using discovered provider command path",
+						"workspace_id", workspaceID, "profile_id", profile.ID,
+						"protocol_family", profile.ProtocolFamily, "command_path", resolved)
+				} else {
+					// Host doesn't have this command — expected on hosts that aren't
+					// provisioned for this profile. Skip without failing.
+					d.logger.Info("skip custom runtime profile: command not found on PATH or provider discovery",
+						"workspace_id", workspaceID, "profile_id", profile.ID,
+						"command_name", profile.CommandName, "error", err)
+					if failureReason != "" {
+						failureReason += "; "
+					}
+					failureReason += "command not found on PATH or provider discovery: " + profile.CommandName
+					*failedProfiles = append(*failedProfiles, map[string]string{
+						"profile_id":   profile.ID,
+						"command_name": profile.CommandName,
+						"reason":       failureReason,
+					})
+					continue
 				}
-				failureReason += "command not found on PATH: " + profile.CommandName
-				*failedProfiles = append(*failedProfiles, map[string]string{
-					"profile_id":   profile.ID,
-					"command_name": profile.CommandName,
-					"reason":       failureReason,
-				})
-				continue
+			} else {
+				resolved = r
 			}
-			resolved = r
 		}
 		// Best-effort version detection; an empty version is acceptable. The
 		// probe carries the profile's fixed_args so a wrapper reports the
@@ -3975,11 +4005,11 @@ func (d *Daemon) handleHeartbeatActions(ctx context.Context, runtimeID string, r
 //
 // The HTTP heartbeat is used on purpose rather than queueing a WS frame: the
 // hint arrives on the read pump, the WS write path may be backed up or tearing
-// down, and this is a human-interactive, low-frequency path (a user opened a
-// model picker) where one extra request is cheaper than a missed wakeup. Note it
-// intentionally bypasses the wsHeartbeatRecentlyAcked suppression that the
-// scheduled HTTP tick honours — that suppression exists to avoid duplicate
-// periodic writes, not to block an explicitly requested pull.
+// down, and this is a human-interactive, low-frequency path where one extra
+// request is cheaper than a missed wakeup. Note it intentionally bypasses the
+// wsHeartbeatRecentlyAcked suppression that the scheduled HTTP tick honours —
+// that suppression exists to avoid duplicate periodic writes, not to block an
+// explicitly requested pull.
 func (d *Daemon) handlePendingWorkHint(runtimeID, kind string) {
 	if runtimeID == "" {
 		return
@@ -4007,10 +4037,10 @@ func (d *Daemon) handlePendingWorkHint(runtimeID, kind string) {
 		d.pendingWorkMu.Unlock()
 		return
 	}
-	// Rate limit per runtime. The hint is caller-triggered (any workspace member
-	// hitting the list-models endpoint), so without a floor a request loop would
-	// become a heartbeat amplifier. A suppressed hint costs nothing but the
-	// pre-existing wait for the scheduled heartbeat.
+	// Rate limit per runtime. The hint is caller-triggered by interactive model
+	// or capability endpoints, so without a floor a request loop would become a
+	// heartbeat amplifier. A suppressed hint costs nothing but the pre-existing
+	// wait for the scheduled heartbeat.
 	if last, ok := d.pendingWorkLastRun[runtimeID]; ok && time.Since(last) < pendingWorkHintMinInterval {
 		d.pendingWorkMu.Unlock()
 		d.logger.Debug("pending work hint throttled", "runtime_id", runtimeID, "kind", kind)
@@ -4025,9 +4055,12 @@ func (d *Daemon) handlePendingWorkHint(runtimeID, kind string) {
 		d.pendingWorkMu.Unlock()
 	}()
 
-	// Root context: handleHeartbeatActions hands this ctx to the actual work
-	// (model discovery shells out to a CLI for up to ~15s), so it must outlive
-	// this function. Only the heartbeat request itself is time-bounded.
+	// Root context: handleHeartbeatActions hands this ctx to the actual work, so
+	// it must outlive this function. Capability discovery and local-skill imports
+	// are normally quick filesystem operations, while model discovery may shell
+	// out to a CLI for up to ~40s on the slowest provider (see
+	// agent.hermesDiscoveryTimeout). Only the heartbeat request itself is
+	// time-bounded.
 	ctx := d.recoveryContext()
 	if ctx.Err() != nil {
 		return
@@ -4056,9 +4089,14 @@ func (d *Daemon) handlePendingWorkHint(runtimeID, kind string) {
 
 // handleModelList resolves the provider's supported models (via static
 // catalog or by shelling out to the agent CLI) and reports the result
-// back to the server. Model discovery failures are reported as empty
-// lists rather than errors so the UI can still render a creatable
-// dropdown.
+// back to the server.
+//
+// How a discovery failure is reported is the provider's decision, not this
+// function's. Providers with a safe static catalog swallow the error and return
+// the stand-in (marked Fallback); providers without one — hermes — return the
+// error, and it is forwarded as status=failed so the picker can show the reason
+// and keep manual entry (MUL-6606). Both outcomes leave the creatable dropdown
+// usable; only the second one tells the user why it is empty.
 func (d *Daemon) handleModelList(ctx context.Context, rt Runtime, requestID string) {
 	d.logger.Info("model list requested", "runtime_id", rt.ID, "request_id", requestID, "provider", rt.Provider)
 
@@ -4106,6 +4144,19 @@ func (d *Daemon) handleModelList(ctx context.Context, rt Runtime, requestID stri
 	if catalog.Fallback {
 		d.logger.Warn("model discovery fell back to a static catalog; reporting it as non-authoritative",
 			"runtime_id", rt.ID, "provider", rt.Provider, "path", execPath, "count", len(models))
+	}
+	if rt.Provider == "codearts" && len(models) == 0 {
+		if home, homeErr := os.UserHomeDir(); homeErr == nil {
+			configuredModels, configErr := loadCodeArtsConfiguredModels(home)
+			if configErr != nil {
+				d.logger.Warn("CodeArts custom model discovery failed",
+					"runtime_id", rt.ID, "path", codeArtsUserConfigPath(home), "error", configErr)
+			} else if len(configuredModels) > 0 {
+				models = configuredModels
+				d.logger.Info("CodeArts model discovery used user-configured providers",
+					"runtime_id", rt.ID, "path", codeArtsUserConfigPath(home), "count", len(models))
+			}
+		}
 	}
 
 	// Wire format matches handler.ModelEntry. Use a struct (not
@@ -4232,9 +4283,9 @@ func (d *Daemon) handleLocalSkillImport(ctx context.Context, rt Runtime, pending
 // runtimeReportBackoffs defines the retry schedule for delivering any
 // daemon→server async result (model list, local-skill list, local-skill
 // import). First attempt runs immediately, then we back off. The sum
-// (≈6.5s) stays well under the server-side running timeout (60s) so a
-// report that eventually lands still updates the request instead of
-// racing a timeout transition.
+// (≈6.5s) leaves most of the server-side running timeout (60s) available for
+// discovery and report attempts. Each HTTP attempt has its own client timeout,
+// so this schedule alone is not an end-to-end delivery deadline.
 //
 // Overridable for tests to avoid real sleeps.
 var runtimeReportBackoffs = []time.Duration{0, 500 * time.Millisecond, 2 * time.Second, 4 * time.Second}
@@ -5064,13 +5115,16 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	// reportTaskResult and execenv.WriteGCMeta below. markActiveEnvRoot
 	// is reference-counted, so the duplicate marks runTask installs are
 	// correctly nested within these.
-	predictedEnvRoot := execenv.PredictRootDir(d.cfg.WorkspacesRoot, task.WorkspaceID, task.ID)
-	if predictedEnvRoot != "" {
-		d.markActiveEnvRoot(predictedEnvRoot)
-		defer d.unmarkActiveEnvRoot(predictedEnvRoot)
+	resolvedEnvRoot, resolveRootErr := execenv.ResolveRootDir(taskRootDirParams(d.cfg.WorkspacesRoot, task))
+	if resolveRootErr != nil {
+		taskLog.Error("resolve stable task env root", "error", resolveRootErr)
+	}
+	if resolvedEnvRoot != "" {
+		d.markActiveEnvRoot(resolvedEnvRoot)
+		defer d.unmarkActiveEnvRoot(resolvedEnvRoot)
 	}
 	if task.PriorWorkDir != "" {
-		if priorRoot := filepath.Dir(task.PriorWorkDir); priorRoot != "" && priorRoot != predictedEnvRoot {
+		if priorRoot := filepath.Dir(task.PriorWorkDir); priorRoot != "" && priorRoot != resolvedEnvRoot {
 			d.markActiveEnvRoot(priorRoot)
 			defer d.unmarkActiveEnvRoot(priorRoot)
 		}
@@ -5595,7 +5649,7 @@ func (d *Daemon) reportTerminalTask(parentCtx context.Context, report terminalTa
 // internal task with no IDs at all). The caller skips writing a meta file
 // in that case so the directory falls back to mtime-based orphan cleanup.
 func gcMetaForTask(task Task) (execenv.GCMeta, bool) {
-	meta := execenv.GCMeta{WorkspaceID: task.WorkspaceID}
+	meta := execenv.GCMeta{WorkspaceID: task.WorkspaceID, TaskID: task.ID}
 	switch {
 	case task.ChatSessionID != "":
 		meta.Kind = execenv.GCKindChat
@@ -5619,6 +5673,16 @@ func gcMetaForTask(task Task) (execenv.GCMeta, bool) {
 	return meta, true
 }
 
+func taskRootDirParams(workspacesRoot string, task Task) execenv.RootDirParams {
+	return execenv.RootDirParams{
+		WorkspacesRoot:  workspacesRoot,
+		WorkspaceID:     task.WorkspaceID,
+		WorkspaceSlug:   task.WorkspaceSlug,
+		TaskID:          task.ID,
+		IssueIdentifier: task.IssueIdentifier,
+	}
+}
+
 // runtimeDisplayNameOverrides maps a provider key to the human-facing runtime
 // name when simple title-casing would read awkwardly. Providers not listed
 // here fall back to capitalizing the key (claude → "Claude", codex → "Codex").
@@ -5626,6 +5690,7 @@ func gcMetaForTask(task Task) (execenv.GCMeta, bool) {
 // this map at init so their display names stay in lockstep with the
 // descriptor.
 var runtimeDisplayNameOverrides = map[string]string{
+	"codearts":   "CodeArts",
 	"dsh":        "DeepSeek Harness",
 	"traecli":    "Trae",
 	"grok":       "Grok",
@@ -5633,6 +5698,7 @@ var runtimeDisplayNameOverrides = map[string]string{
 	"qwen":       "Qwen Code",
 	"qwenpaw":    "QwenPaw",
 	"mcode":      "MiniMax Code",
+	"zeroclaw":   "ZeroClaw",
 }
 
 func init() {
@@ -5682,16 +5748,22 @@ func providerNeedsInlineSystemPrompt(provider string) bool {
 	}
 }
 
-// gateResumeToReusedWorkdir clears the task's prior session unless this run
+// gateResumeToReachableSession clears the task's prior session unless this run
 // can actually reach the store the session lives in, and reports whether that
-// held. CLI backends key their session stores to the cwd (Claude Code looks
-// sessions up under ~/.claude/projects/<encoded-cwd>/), so a session id from a
-// different workdir can never resolve: the CLI exits within a second and the
-// run fails before doing any work — permanently, because the failed run
-// records no session and the next claim serves the same stale pointer again.
-// This fires whenever the prior workdir no longer exists (GC'd after the issue
-// went done, daemon reinstall, manual cleanup) and execenv.Reuse fell back to a
-// fresh Prepare (GitHub #3854).
+// held. Most CLI backends key their session stores to the cwd (Claude Code
+// looks sessions up under ~/.claude/projects/<encoded-cwd>/), so a session id
+// from a different workdir can never resolve: the CLI exits within a second
+// and the run fails before doing any work — permanently, because the failed
+// run records no session and the next claim serves the same stale pointer
+// again. This fires whenever the prior workdir no longer exists (GC'd after
+// the issue went done, daemon reinstall, manual cleanup) and execenv.Reuse fell
+// back to a fresh Prepare (GitHub #3854).
+//
+// Pi and OMP are the exception. Their opaque session id is an absolute JSONL
+// path under ~/.multica/pi-sessions, and the backend passes that path directly
+// to --session. The transcript remains resumable when only the task workdir
+// changes, so binding it to workdir reuse discards healthy conversation history
+// and forces the model to reconstruct it through `multica chat history`.
 //
 // A matching workdir is not sufficient on its own. Hermes keys its sessions to
 // HERMES_HOME — the per-task overlay under envRoot — not to the cwd, and the
@@ -5706,8 +5778,8 @@ func providerNeedsInlineSystemPrompt(provider string) bool {
 // HermesSessionStore) — and false drops the resume with the same disclosure as
 // a workdir mismatch.
 // sameExistingDir reports whether two paths name the same existing directory.
-// False when either cannot be stat'd, which is the safe answer here: an absent
-// prior workdir means there is nothing to resume from.
+// False when either cannot be stat'd, which is the safe answer for cwd-keyed
+// providers: an absent prior workdir means there is nothing to resume from.
 func sameExistingDir(a, b string) bool {
 	if a == "" || b == "" {
 		return false
@@ -5723,15 +5795,21 @@ func sameExistingDir(a, b string) bool {
 	return os.SameFile(ai, bi)
 }
 
-func gateResumeToReusedWorkdir(task *Task, taskCtx *execenv.TaskContextForEnv, envWorkDir string, sessionHomeReachable bool, taskLog *slog.Logger) bool {
-	// Compare the directories, not the spelling. Reuse runs in the canonical
-	// path it validated and locked, which need not be character-identical to
-	// the PriorWorkDir the server sent — a symlinked workspaces root is enough
-	// to make them differ. A string compare would then silently drop the prior
-	// session on every follow-up task in that installation.
-	reused := task.PriorWorkDir != "" && sameExistingDir(envWorkDir, task.PriorWorkDir) && sessionHomeReachable
-	if !reused && task.PriorSessionID != "" {
+func gateResumeToReachableSession(task *Task, taskCtx *execenv.TaskContextForEnv, provider, envWorkDir string, sessionHomeReachable bool, taskLog *slog.Logger) bool {
+	var reachable bool
+	if providerUsesPiSessionFile(provider) {
+		reachable = piSessionFilePresent(task.PriorSessionID)
+	} else {
+		// Compare the directories, not the spelling. Reuse runs in the canonical
+		// path it validated and locked, which need not be character-identical to
+		// the PriorWorkDir the server sent — a symlinked workspaces root is enough
+		// to make them differ. A string compare would then silently drop the prior
+		// session on every follow-up task in that installation.
+		reachable = task.PriorWorkDir != "" && sameExistingDir(envWorkDir, task.PriorWorkDir) && sessionHomeReachable
+	}
+	if !reachable && task.PriorSessionID != "" {
 		taskLog.Info("dropping prior session: session store not reachable from this run",
+			"provider", provider,
 			"session_id", task.PriorSessionID,
 			"prior_workdir", task.PriorWorkDir,
 			"workdir", envWorkDir,
@@ -5746,7 +5824,27 @@ func gateResumeToReusedWorkdir(task *Task, taskCtx *execenv.TaskContextForEnv, e
 		taskCtx.PriorSessionResumeUnavailable = true
 		task.PriorSessionResumeUnavailable = true
 	}
-	return reused
+	return reachable
+}
+
+func providerUsesPiSessionFile(provider string) bool {
+	if provider == "pi" {
+		return true
+	}
+	desc, ok := agent.BuiltinRuntimeByID(provider)
+	return ok && desc.ProtocolFamily == "pi"
+}
+
+// piSessionFilePresent proves there is persisted history to resume. It does
+// not claim the transcript is idle: the Pi backend takes an exclusive lock for
+// the complete child-process lifetime and reports a busy resume as rejected so
+// runTask falls back to its existing one-shot fresh-session path.
+func piSessionFilePresent(sessionID string) bool {
+	if sessionID == "" {
+		return false
+	}
+	info, err := os.Stat(sessionID)
+	return err == nil && info.Mode().IsRegular() && info.Size() > 0
 }
 
 // sessionHomeReachable reports whether a session recorded by a prior task on
@@ -5768,9 +5866,8 @@ func gateResumeToReusedWorkdir(task *Task, taskCtx *execenv.TaskContextForEnv, e
 //   - With no store, the transcript is the overlay's own task-local file, which
 //     survives exactly when this run reused the prior task's env root.
 //
-// Every other provider is keyed by cwd (or resolves its own store), so the
-// workdir comparison in gateResumeToReusedWorkdir remains the whole answer and
-// this returns true.
+// Every other provider is keyed by cwd or handles its independently addressed
+// store in gateResumeToReachableSession, so this predicate returns true.
 func sessionHomeReachable(provider string, env *execenv.Environment, envReused bool) bool {
 	if provider != "hermes" {
 		return true
@@ -5784,7 +5881,7 @@ func sessionHomeReachable(provider string, env *execenv.Environment, envReused b
 // shouldReusePriorWorkdir keeps the local_directory lock and cross-agent
 // isolation invariants without forcing managed follow-ups onto a fresh
 // provider session. Every managed issue or chat task may reuse only directories
-// that resolve to the {workspace}/{task}/workdir shape, carry Prepare-time
+// that resolve to the two-segment managed root shape, carry Prepare-time
 // managed-env provenance for the same workspace/scope/agent, and carry a
 // matching daemon task-context marker. Other task kinds have no durable scope
 // with which to prove ownership and therefore start fresh.
@@ -5819,7 +5916,7 @@ func shouldReusePriorWorkdir(task Task, localAssignment *localDirectoryAssignmen
 		return "", false
 	}
 	parts := strings.Split(rel, string(filepath.Separator))
-	if len(parts) != 3 || parts[0] != task.WorkspaceID || parts[1] == "" || parts[2] != "workdir" {
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] != "workdir" {
 		return "", false
 	}
 	if task.AgentID == "" || (task.IssueID == "" && task.ChatSessionID == "") {
@@ -5865,7 +5962,7 @@ func shouldReusePriorWorkdir(task Task, localAssignment *localDirectoryAssignmen
 
 // gateCodexResumeToRolloutPresence drops the prior Codex session when its
 // rollout is not actually present in the task's CODEX_HOME sessions. A reused
-// workdir keeps PriorSessionID (gateResumeToReusedWorkdir), but Codex session
+// workdir keeps PriorSessionID (gateResumeToReachableSession), but Codex session
 // isolation (MUL-4424) means the rollout may be missing: a migrated legacy home
 // that could not locate it, or a local_directory task whose shared history was
 // pruned. Codex would then silently thread/start from scratch, so we clear the
@@ -5993,17 +6090,19 @@ func (d *Daemon) ensureTaskSkillBundles(ctx context.Context, task *Task) error {
 	// one. (GitHub #4505 / MUL-3650)
 	for _, ref := range misses {
 		started := time.Now()
-		bundle, err := d.resolveSkillBundle(ctx, task, ref)
+		bundle, stats, err := d.resolveSkillBundle(ctx, task, ref)
 		if err != nil {
-			// Name the skill, its declared size, and how long we actually
-			// waited. The bare "resolve skill bundles: context deadline
-			// exceeded" this replaced was indistinguishable from a generic
-			// network fault, and cost a community thread three hours of
-			// guesswork (MUL-5370): size + elapsed separate "this bundle is
-			// too big for the link" from "the link is dead".
-			return fmt.Errorf("%w: skill %q (id=%s, %d bytes) after %s: %w",
-				errSkillBundleUnavailable, ref.Name, ref.ID, ref.SizeBytes,
-				time.Since(started).Round(time.Millisecond), err)
+			if isSkillBundleTransferFailure(err) {
+				// Only transport failures and incomplete 2xx bodies get the
+				// network diagnosis. HTTP error responses and invalid complete
+				// payloads retain their server semantics instead of being
+				// relabelled as connectivity problems (GitHub #7386).
+				return fmt.Errorf("%w: %s: %w",
+					errSkillBundleUnavailable,
+					describeSkillBundleFailure(ref, stats, time.Since(started)),
+					err)
+			}
+			return fmt.Errorf("%w: %w", errSkillBundleUnavailable, err)
 		}
 		resolved[skillRefKey(bundle.Source, bundle.ID)] = bundle
 	}
@@ -6026,13 +6125,13 @@ func (d *Daemon) ensureTaskSkillBundles(ctx context.Context, task *Task) error {
 // timeout, so a large bundle on a slow link is given room to finish instead of
 // being cut off mid-body. Caching on success is what lets the resolve converge
 // across dispatches. (GitHub #4505 / MUL-3650)
-func (d *Daemon) resolveSkillBundle(ctx context.Context, task *Task, ref SkillRefData) (SkillData, error) {
+func (d *Daemon) resolveSkillBundle(ctx context.Context, task *Task, ref SkillRefData) (SkillData, TransferStats, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, skillBundleResolveTimeout(ref.SizeBytes))
 	defer cancel()
 
-	bundle, err := d.client.ResolveSkillBundle(reqCtx, task.RuntimeID, task.ID, ref)
+	bundle, stats, err := d.client.ResolveSkillBundle(reqCtx, task.RuntimeID, task.ID, ref)
 	if err != nil {
-		return SkillData{}, err
+		return SkillData{}, stats, err
 	}
 	// The resolve endpoint serves the agent's *current* bundle and hash, which
 	// may differ from the claim-time ref when the skill was edited between
@@ -6041,7 +6140,7 @@ func (d *Daemon) resolveSkillBundle(ctx context.Context, task *Task, ref SkillRe
 	// bundle for self-consistency against a ref derived from itself — pinning
 	// it to the possibly-stale requested hash would reject a legitimate update.
 	if bundle.Source != ref.Source || bundle.ID != ref.ID {
-		return SkillData{}, fmt.Errorf("resolve skill bundle returned wrong skill: requested source=%s id=%s, got source=%s id=%s", ref.Source, ref.ID, bundle.Source, bundle.ID)
+		return SkillData{}, stats, fmt.Errorf("resolve skill bundle returned wrong skill: requested source=%s id=%s, got source=%s id=%s", ref.Source, ref.ID, bundle.Source, bundle.ID)
 	}
 	bundleRef := skillRefFromBundle(bundle)
 	validationRef := bundleRef
@@ -6049,7 +6148,7 @@ func (d *Daemon) resolveSkillBundle(ctx context.Context, task *Task, ref SkillRe
 		validationRef = ref
 	}
 	if !validateSkillBundle(validationRef, bundle) {
-		return SkillData{}, fmt.Errorf("resolve skill bundle returned invalid bundle: skill_id=%s source=%s hash=%s", bundle.ID, bundle.Source, bundle.Hash)
+		return SkillData{}, stats, fmt.Errorf("resolve skill bundle returned invalid bundle: skill_id=%s source=%s hash=%s", bundle.ID, bundle.Source, bundle.Hash)
 	}
 	if err := d.skillCache.WithRefLock(task.WorkspaceID, validationRef, func() error {
 		return d.skillCache.Store(task.WorkspaceID, bundle)
@@ -6064,7 +6163,87 @@ func (d *Daemon) resolveSkillBundle(ctx context.Context, task *Task, ref SkillRe
 			)
 		}
 	}
-	return bundle, nil
+	return bundle, stats, nil
+}
+
+// isSkillBundleTransferFailure identifies errors for which byte-level network
+// diagnostics are meaningful. A requestError is an explicit server response;
+// malformed but complete JSON and bundle-validation errors are server payload
+// problems. Neither should be presented as a slow or dead network link. In
+// particular, json.Decoder can synthesize io.ErrUnexpectedEOF after its source
+// ended with a clean EOF, so that decoder error alone is not transport proof.
+func isSkillBundleTransferFailure(err error) bool {
+	var reqErr *requestError
+	if errors.As(err, &reqErr) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
+// describeSkillBundleFailure renders the diagnostic half of a failed bundle
+// download: what was being fetched, how many HTTP response-body bytes arrived,
+// the separately declared decoded content size, and whether this host has a
+// proxy at all.
+//
+// The three facts answer the three wrong turns the old text invited. "network
+// error downloading skill X" instead of "skill X unavailable" stops the reader
+// blaming the skill. The response byte count distinguishes a dead link from a
+// partial response without pretending JSON wire bytes and decoded skill-content
+// bytes form one progress ratio. The proxy note catches the case behind GitHub
+// #7386, where a daemon that inherited no proxy on a cross-border link never got
+// a byte through while the same host succeeded through a local proxy.
+func describeSkillBundleFailure(ref SkillRefData, stats TransferStats, elapsed time.Duration) string {
+	elapsed = elapsed.Round(time.Millisecond)
+	var transfer string
+	switch {
+	case !stats.ResponseStarted:
+		transfer = fmt.Sprintf("no successful response from server after %s overall", elapsed)
+	case stats.BytesRead == 0:
+		transfer = fmt.Sprintf("a successful response started but delivered no body bytes before failing after %s overall", elapsed)
+	default:
+		// BytesRead is a single-attempt high-water mark, while elapsed covers
+		// the logical call including retries and backoff. State both scopes
+		// rather than deriving a rate from mismatched measurements.
+		transfer = fmt.Sprintf("received up to %s of response body data in one attempt; failed after %s overall",
+			formatBytes(stats.BytesRead), elapsed)
+	}
+	return fmt.Sprintf("network error downloading skill %q (id=%s): %s; declared skill content size %s; %s; the skill content is not at fault",
+		ref.Name, ref.ID, transfer, formatBytes(ref.SizeBytes), proxyEnvSummary())
+}
+
+// proxyEnvSummary reports whether the daemon inherited any proxy setting. It
+// names the variable but never its value: proxy URLs routinely embed
+// credentials, and this string lands in task failure text the whole workspace
+// can read.
+//
+// Go's transport only consults these variables — it does not read the Windows
+// system proxy — and it reads them at process start, so a daemon that was
+// already running when they were set still shows none (GitHub #7386).
+func proxyEnvSummary() string {
+	for _, key := range []string{"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"} {
+		if strings.TrimSpace(os.Getenv(key)) != "" {
+			return fmt.Sprintf("proxy configured (%s)", key)
+		}
+	}
+	return "no proxy configured (HTTPS_PROXY unset)"
+}
+
+// formatBytes renders a byte count for humans reading a failure message.
+func formatBytes(n int64) string {
+	switch {
+	case n < 0:
+		return "unknown size"
+	case n < 1024:
+		return fmt.Sprintf("%d B", n)
+	case n < 1024*1024:
+		return fmt.Sprintf("%.0f KB", float64(n)/1024)
+	default:
+		return fmt.Sprintf("%.2f MB", float64(n)/(1024*1024))
+	}
 }
 
 const (
@@ -6630,14 +6809,17 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 
 	// Mark candidate env roots as active before any env work so the GC loop
 	// can't reclaim artifacts inside them mid-execution. We mark both the
-	// predicted root for a fresh Prepare and the prior root for Reuse — they
+	// stable root for a fresh Prepare and the prior root for Reuse — they
 	// usually differ (Reuse keeps the original task's directory).
-	predictedRoot := execenv.PredictRootDir(d.cfg.WorkspacesRoot, task.WorkspaceID, task.ID)
-	d.markActiveEnvRoot(predictedRoot)
-	defer d.unmarkActiveEnvRoot(predictedRoot)
+	resolvedRoot, err := execenv.ResolveRootDir(taskRootDirParams(d.cfg.WorkspacesRoot, task))
+	if err != nil {
+		return TaskResult{}, fmt.Errorf("resolve stable task env root: %w", err)
+	}
+	d.markActiveEnvRoot(resolvedRoot)
+	defer d.unmarkActiveEnvRoot(resolvedRoot)
 	if task.PriorWorkDir != "" {
 		priorRoot := filepath.Dir(task.PriorWorkDir)
-		if priorRoot != predictedRoot {
+		if priorRoot != resolvedRoot {
 			d.markActiveEnvRoot(priorRoot)
 			defer d.unmarkActiveEnvRoot(priorRoot)
 		}
@@ -6652,7 +6834,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// *os.File cannot cross its JSON response back to us. Claiming there would
 	// leave the agent running with no protection at all — which is exactly the
 	// re-dispatch window this guards.
-	envClaim, err := execenv.ClaimEnvRoot(d.cfg.WorkspacesRoot, task.WorkspaceID, task.ID)
+	envClaim, err := execenv.ClaimEnvRoot(taskRootDirParams(d.cfg.WorkspacesRoot, task))
 	if err != nil {
 		return TaskResult{}, fmt.Errorf("claim execution environment: %w", err)
 	}
@@ -6935,11 +7117,13 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if env == nil {
 		var err error
 		prepParams := execenv.PrepareParams{
-			WorkspacesRoot: d.cfg.WorkspacesRoot,
-			Profile:        d.cfg.Profile,
-			WorkspaceID:    task.WorkspaceID,
-			TaskID:         task.ID,
-			AgentName:      agentName,
+			WorkspacesRoot:  d.cfg.WorkspacesRoot,
+			Profile:         d.cfg.Profile,
+			WorkspaceID:     task.WorkspaceID,
+			WorkspaceSlug:   task.WorkspaceSlug,
+			TaskID:          task.ID,
+			IssueIdentifier: task.IssueIdentifier,
+			AgentName:       agentName,
 			// This run already holds the claim (envClaim above) and the reset
 			// it implies; preparation must not try to take it again.
 			EnvRootPreclaimed:     true,
@@ -7036,8 +7220,8 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		}
 	}
 	// Belt-and-suspenders: also mark whatever root we ended up with, in case
-	// future changes diverge from PredictRootDir.
-	if env.RootDir != predictedRoot && env.RootDir != "" {
+	// future changes diverge from ResolveRootDir.
+	if env.RootDir != resolvedRoot && env.RootDir != "" {
 		d.markActiveEnvRoot(env.RootDir)
 		defer d.unmarkActiveEnvRoot(env.RootDir)
 	}
@@ -7201,13 +7385,13 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	cancelPrepare()
 	_ = d.client.ReportProgress(ctx, task.ID, fmt.Sprintf("Launching %s", provider), 1, 2)
 
-	reused := gateResumeToReusedWorkdir(&task, &taskCtx, env.WorkDir, sessionHomeReachable(provider, env, envReused), taskLog)
+	resumeReachable := gateResumeToReachableSession(&task, &taskCtx, provider, env.WorkDir, sessionHomeReachable(provider, env, envReused), taskLog)
 	// A reused workdir is necessary but not sufficient for a Codex resume: the
 	// prior thread's rollout must actually be present in this task's CODEX_HOME
 	// sessions (MUL-4424 isolates them). Drop the resume before the brief is
 	// generated below if it isn't, so we never tell the agent it is continuing a
 	// conversation Codex will silently restart from scratch.
-	if reused {
+	if resumeReachable {
 		gateCodexResumeToRolloutPresence(&task, &taskCtx, provider, env.CodexHome, taskLog)
 	}
 
@@ -7397,7 +7581,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		"provider", provider,
 		"workdir", env.WorkDir,
 		"model", model,
-		"reused", reused,
+		"resume_reachable", resumeReachable,
 	)
 	if task.PriorSessionID != "" {
 		taskLog.Info("resuming session", "session_id", task.PriorSessionID)
@@ -7433,7 +7617,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	model, thinkingLevel, serviceTier = selection.Model, selection.ThinkingLevel, selection.ServiceTier
 
 	var idleWatchdogTimeout time.Duration
-	if provider == "opencode" {
+	if provider == "opencode" || provider == "codearts" {
 		idleWatchdogTimeout = d.cfg.OpenCodeIdleWatchdog
 	}
 	execOpts := agent.ExecOptions{
@@ -7445,6 +7629,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		FirstTurnNoProgressTimeout: d.cfg.CodexFirstTurnNoProgressTimeout,
 		IdleWatchdogTimeout:        idleWatchdogTimeout,
 		HandshakeTimeout:           d.cfg.CodexHandshakeTimeout,
+		ThreadHandshakeTimeout:     d.cfg.CodexThreadHandshakeTimeout,
 		ResumeSessionID:            task.PriorSessionID,
 		// Post-gate intent: PriorSessionID here already reflects the pre-flight
 		// resume gates (a dropped resume is surfaced via the prompt instead). If it
@@ -7557,7 +7742,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		firstResult := result
 		firstUsage := result.Usage
 		firstTools := tools
-		retiredSessionID = task.PriorSessionID
+		if !result.ResumeRejectedTransient {
+			retiredSessionID = task.PriorSessionID
+		}
 		taskLog.Warn("session resume failed, retrying with fresh session", "error", result.Error)
 
 		// Rebuild cold-session context before the single retry. The prior
@@ -7857,9 +8044,12 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 // how this went wrong before:
 //
 //  1. Would a fresh session even fix this? Only if the resume itself was
-//     refused — the transcript is gone, or it belongs to another provider
-//     account. result.ResumeRejected is the backend's positive evidence of
-//     that, and where a backend can produce it, it is the whole answer.
+//     refused — permanently because the transcript is gone or belongs to
+//     another provider account, or transiently because another live run owns
+//     it. result.ResumeRejected and result.ResumeRejectedTransient are the
+//     backend's positive evidence of those two cases. Both allow a fresh retry,
+//     but only the permanent signal retires the prior session from later
+//     lookups.
 //     Answering by exclusion alone would invert the burden of proof: the
 //     failures a new session cures are a small enumerable set, while the
 //     ones it cannot are open-ended. A network drop, a 429, a quota trip or
@@ -7873,7 +8063,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 //     Not every backend can answer, though, and a false ResumeRejected means
 //     different things depending on who produced it: "checked, not a
 //     rejection" from a capable backend, "could not tell" from one of the
-//     five in agent.ResumeRejectionUndetectable. That is why provider is a
+//     backends in agent.ResumeRejectionUndetectable. That is why provider is a
 //     parameter — without it the compatibility branch below would silently
 //     apply to every backend, second-guessing capable ones by exclusion.
 //
@@ -7890,7 +8080,7 @@ func shouldRetryWithFreshSession(result agent.Result, priorSessionID string, too
 		return false
 	}
 	// Positive evidence: the backend proved the resume was refused.
-	if result.ResumeRejected {
+	if result.ResumeRejected || result.ResumeRejectedTransient {
 		return true
 	}
 	// Positive evidence of a different kind: the resume was NOT refused —
@@ -7952,14 +8142,14 @@ func shouldRetryWithFreshSession(result agent.Result, priorSessionID string, too
 	if !agent.ResumeRejectionUndetectable(provider) {
 		return false
 	}
-	// antigravity, copilot, cursor, deveco and opencode scrape SessionID out
+	// antigravity, codearts, copilot, cursor, deveco and opencode scrape SessionID out
 	// of stream output and have no rejection string captured anywhere, so an
 	// empty SessionID is the only thing they can offer. It proves no session
 	// was established this run, which is exactly what the gate relied on for
 	// every backend before ResumeRejected existed; keeping it preserves their
 	// recovery instead of silently removing it.
 	//
-	// Inventing rejection phrases for these five would be the alternative,
+	// Inventing rejection phrases for these backends would be the alternative,
 	// and it is worse: no real output has been captured for any of them, and
 	// a false positive discards a recoverable session pointer.
 	return result.SessionID == "" && freshSessionMayHelp(result.Error)
@@ -8405,6 +8595,28 @@ func idleWatchdogReason(window time.Duration) string {
 	return fmt.Sprintf("agent produced no new messages for %s and message queue was empty; force-stopped by idle watchdog", window)
 }
 
+// idleWatchdogTickInterval picks how often the idle watchdog re-checks the
+// silence budget. Half the window is the base rate, capped at
+// idleWatchdogMaxTick so a run is force-stopped within window + tick rather
+// than window * 1.5. Sub-nanosecond halves fall back to the window itself so
+// tests can pass tiny budgets and still get a valid ticker.
+//
+// There used to be a `window >= time.Minute && interval < 30*time.Second` floor
+// here, meant to keep production polling no faster than 30 s. It was
+// unreachable — window >= 1 min implies window/2 >= 30 s — and its only effect
+// was to make the tests around it read as if a floor were being exercised.
+// Production windows are minutes or hours, so window/2 already clears 30 s.
+func idleWatchdogTickInterval(window time.Duration) time.Duration {
+	interval := window / 2
+	if interval > idleWatchdogMaxTick {
+		interval = idleWatchdogMaxTick
+	}
+	if interval <= 0 {
+		interval = window
+	}
+	return interval
+}
+
 // runIdleWatchdog ticks until either agentCtx is cancelled or the backend has
 // been silent past the applicable budget. On firing, it records the tripped
 // threshold, sets fired, and calls cancel, which propagates to the agent
@@ -8412,30 +8624,24 @@ func idleWatchdogReason(window time.Duration) string {
 // silence budget depends on whether a tool call is in flight:
 //
 //  1. No tool in flight — a silent backend is a hang after `window`.
-//  2. A tool in flight (tool_use with no matching tool_result yet) — a real
-//     tool (e.g. `npm install`, `docker build`) legitimately runs silently for
-//     many minutes, so the larger `toolWindow` applies instead. toolWindow <= 0
-//     keeps the historical behavior of never force-stopping while a tool is in
-//     flight. Without this in-flight budget a backend that emits tool_use and
-//     never the matching tool_result would run forever now that there is no
-//     wall-clock cap (MUL-3064).
+//  2. A tool in flight (tool_use with no matching tool_result yet) —
+//     `toolWindow` applies instead. It defaults to `window`, so the two are
+//     normally identical and this branch only changes which duration the
+//     failure message reports; an operator who deliberately sets
+//     MULTICA_AGENT_TOOL_WATCHDOG higher buys long tools extra room, and
+//     toolWindow <= 0 keeps the historical behavior of never force-stopping
+//     while a tool is in flight. Without this in-flight budget a backend that
+//     emits tool_use and never the matching tool_result would run forever now
+//     that there is no wall-clock cap (MUL-3064).
 //
 // In both cases the watchdog also requires the session.Messages buffer to be
 // empty — a buffered-but-undrained message means the drain loop is behind, not
 // the backend.
 //
-// Tick interval is window/2 (floored at 30 s in production, but the floor only
-// kicks in for windows >= 1 min so tests can pass tiny windows like 50 ms and
-// see the watchdog fire within a few ticks).
+// Polling rate comes from idleWatchdogTickInterval, so a run is force-stopped
+// somewhere between its budget and budget + tick, never earlier.
 func (d *Daemon) runIdleWatchdog(agentCtx context.Context, window, toolWindow time.Duration, lastActivityAt *atomic.Int64, inFlightTools *atomic.Int32, fired *atomic.Bool, firedThreshold *atomic.Int64, cancel context.CancelFunc, messages <-chan agent.Message, taskLog *slog.Logger, taskID string) {
-	interval := window / 2
-	if window >= time.Minute && interval < 30*time.Second {
-		interval = 30 * time.Second
-	}
-	if interval <= 0 {
-		interval = window
-	}
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(idleWatchdogTickInterval(window))
 	defer ticker.Stop()
 	for {
 		select {
