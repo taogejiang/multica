@@ -218,9 +218,47 @@ Recommended commands:
 
 ```bash
 cd /home/q/docker/multica/multica_private
-docker-compose ps
-docker-compose build <services>
-docker-compose up -d <services>
+./scripts/compose.sh ps
+MULTICA_IMAGE_TAG=<commit-sha> ./scripts/compose.sh build <services>
+./scripts/compose.sh up -d <services>
+```
+
+#### Mandatory Private Compose Wrapper
+
+Always use `/home/q/docker/multica/multica_private/scripts/compose.sh` for
+private deployment commands. Do not call `docker-compose` or `docker compose`
+directly from the private deployment directory.
+
+`scripts/compose.sh` is part of the deployment contract: before delegating to
+Compose it loads `.env` and, when present, exports secrets from:
+
+- `runtime/lark_secret_key.txt` as `MULTICA_LARK_SECRET_KEY`
+- `runtime/resend_api_key.txt` as `RESEND_API_KEY`
+
+Bypassing this wrapper can make an existing Lark/Feishu integration appear
+disabled after an upgrade, or make stored encrypted bot credentials unusable.
+Never regenerate `runtime/lark_secret_key.txt` when it already exists; the
+existing key protects stored integration credentials. Keep the file mode at
+`600` and never copy its contents into logs, archives, or chat.
+
+Before any service replacement, verify the wrapper and runtime files without
+printing secret values:
+
+```bash
+cd /home/q/docker/multica/multica_private
+test -x scripts/compose.sh
+test -s runtime/lark_secret_key.txt
+test "$(stat -c '%a' runtime/lark_secret_key.txt)" = 600
+./scripts/compose.sh ps
+```
+
+Use the wrapper for every lifecycle operation, including status, logs, build,
+restart, and `up`/`down`:
+
+```bash
+./scripts/compose.sh logs --tail=200 backend
+./scripts/compose.sh up -d backend
+./scripts/compose.sh up -d frontend
 ```
 
 Before deployment:
@@ -228,11 +266,14 @@ Before deployment:
 - Read the current dated upgrade record
 - Require a verified database backup when migrations are present
 - Record current image tags and service health for rollback
+- Verify `scripts/compose.sh` is used for all private Compose operations
+- Verify `runtime/lark_secret_key.txt` and other runtime secret files exist with restrictive permissions
 
 After deployment:
 
 - Update the dated record with image digests, migration outcome, service state, and acceptance results
 - Update `upgrades/README.md` from `Pending` to the actual rollout status
+- Confirm integrations that depend on runtime secret files, especially Lark/Feishu and email, are enabled before declaring acceptance complete
 
 ## Reporting Format
 
