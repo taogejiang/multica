@@ -5,7 +5,7 @@ Shared test fixtures and utilities for Multica SDK tests.
 import pytest
 from unittest.mock import MagicMock, patch
 
-from client import MulticaConfig, MulticaClient
+from ..client import MulticaConfig, MulticaClient
 
 
 @pytest.fixture
@@ -66,6 +66,17 @@ def sample_agent():
         "status": "active",
         "model": "claude-sonnet-4",
         "max_concurrent_tasks": 3,
+    }
+
+
+@pytest.fixture
+def sample_squad():
+    return {
+        "id": "squad-001",
+        "name": "Code Reviewer Team",
+        "description": "Code review routing squad",
+        "leader_id": "agent-001",
+        "member_count": 1,
     }
 
 

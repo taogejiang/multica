@@ -3,7 +3,7 @@
 import pytest
 from unittest.mock import ANY, MagicMock
 
-from client import MulticaClient, MulticaConfig, MulticaAPIError
+from ..client import MulticaClient, MulticaConfig, MulticaAPIError
 
 
 def mock_response(json_data=None, status_code=200, text=None):
@@ -196,6 +196,25 @@ class TestAgents:
         assert result is None
 
 
+# ── Squads ────────────────────────────────────────────────────
+
+class TestSquads:
+    def test_list_squads(self, client, mock_request, sample_squad):
+        mock_request.return_value = mock_response([sample_squad])
+        result = client.list_squads(workspace_id="ws-001")
+        assert result == [sample_squad]
+
+    def test_find_squad_by_name_exact(self, client, mock_request, sample_squad):
+        mock_request.return_value = mock_response([sample_squad])
+        result = client.find_squad_by_name("Code Reviewer Team", workspace_id="ws-001")
+        assert result == sample_squad
+
+    def test_find_squad_by_name_not_found(self, client, mock_request):
+        mock_request.return_value = mock_response([])
+        result = client.find_squad_by_name("nonexistent", workspace_id="ws-001")
+        assert result is None
+
+
 # ── Issues ────────────────────────────────────────────────────
 
 class TestIssues:
@@ -220,8 +239,15 @@ class TestIssues:
         mock_request.return_value = mock_response(sample_issue)
         client.create_issue(title="Test", assignee_user_id="user-001")
         sent_json = mock_request.call_args.kwargs["json"]
-        assert sent_json["assignee_type"] == "user"
+        assert sent_json["assignee_type"] == "member"
         assert sent_json["assignee_id"] == "user-001"
+
+    def test_create_issue_with_squad_assignee(self, client, mock_request, sample_issue):
+        mock_request.return_value = mock_response(sample_issue)
+        client.create_issue(title="Test", assignee_squad_id="squad-001")
+        sent_json = mock_request.call_args.kwargs["json"]
+        assert sent_json["assignee_type"] == "squad"
+        assert sent_json["assignee_id"] == "squad-001"
 
     def test_create_issue_both_assignees_raises(self, client):
         with pytest.raises(ValueError, match="cannot be specified simultaneously"):
@@ -273,6 +299,24 @@ class TestCreateIssueByName:
         assert sent_json["assignee_id"] == "agent-001"
         assert sent_json["priority"] == "high"
 
+    def test_by_name_squad_success(self, client, mock_request, sample_project, sample_squad, sample_issue):
+        mock_request.side_effect = [
+            mock_response({"projects": [sample_project], "total": 1}),
+            mock_response([sample_squad]),
+            mock_response(sample_issue),
+        ]
+        result = client.create_issue_by_name(
+            title="Test task", project_name="auto_code_review",
+            squad_name="Code Reviewer Team", workspace_id="ws-001",
+        )
+        assert result == sample_issue
+        assert mock_request.call_count == 3
+        create_call = mock_request.call_args_list[-1]
+        sent_json = create_call.kwargs["json"]
+        assert sent_json["project_id"] == "proj-001"
+        assert sent_json["assignee_type"] == "squad"
+        assert sent_json["assignee_id"] == "squad-001"
+
     def test_by_name_project_not_found(self, client, mock_request):
         mock_request.return_value = mock_response({"projects": [], "total": 0})
         with pytest.raises(ValueError, match="Project not found"):
@@ -289,6 +333,23 @@ class TestCreateIssueByName:
             client.create_issue_by_name(
                 title="Test", project_name="auto_code_review",
                 agent_name="nonexistent", workspace_id="ws-001",
+            )
+
+    def test_by_name_squad_not_found(self, client, mock_request, sample_project):
+        mock_request.side_effect = [
+            mock_response({"projects": [sample_project], "total": 1}),
+            mock_response([]),
+        ]
+        with pytest.raises(ValueError, match="Squad not found"):
+            client.create_issue_by_name(
+                title="Test", project_name="auto_code_review",
+                squad_name="nonexistent", workspace_id="ws-001",
+            )
+
+    def test_by_name_agent_and_squad_raises(self, client):
+        with pytest.raises(ValueError, match="agent_name and squad_name"):
+            client.create_issue_by_name(
+                title="Test", agent_name="code_reviewer", squad_name="Code Reviewer Team",
             )
 
     def test_by_name_workspace_required(self, client, mock_request):

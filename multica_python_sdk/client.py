@@ -252,6 +252,56 @@ class MulticaClient:
         
         return None
 
+    # ── Squads ────────────────────────────────────────────────
+
+    def list_squads(self, workspace_id: Optional[str] = None,
+                    include_archived: bool = False) -> list[dict]:
+        """List all squads (teams)"""
+        params = {}
+        if workspace_id:
+            params["workspace_id"] = workspace_id
+        if include_archived:
+            params["include_archived"] = "true"
+        return self._request("GET", "/api/squads/", params=params)
+
+    def get_squad(self, squad_id: str) -> dict:
+        """Get squad details"""
+        return self._request("GET", f"/api/squads/{squad_id}/")
+
+    def find_squad_by_name(self, squad_name: str, workspace_id: Optional[str] = None,
+                           workspace_slug: Optional[str] = None,
+                           workspace_name: Optional[str] = None) -> Optional[dict]:
+        """
+        Find squad by name
+
+        Args:
+            squad_name: Squad name (e.g., "Code Reviewer Team")
+            workspace_id: Optional workspace ID. Auto-detected if not provided.
+            workspace_slug: Optional workspace slug.
+
+        Returns:
+            Matching squad dict, or None if not found
+        """
+        ws_id = self._resolve_workspace_id(workspace_id, workspace_slug, workspace_name)
+        squads = self.list_squads(workspace_id=ws_id)
+
+        # Exact match
+        exact_matches = [squad for squad in squads if squad.get("name") == squad_name]
+        if len(exact_matches) > 1:
+            raise ValueError(f"Multiple squads found with name: {squad_name}")
+        if exact_matches:
+            return exact_matches[0]
+
+        # Case-insensitive match
+        squad_name_lower = squad_name.lower()
+        case_matches = [squad for squad in squads if squad.get("name", "").lower() == squad_name_lower]
+        if len(case_matches) > 1:
+            raise ValueError(f"Multiple squads found with name: {squad_name}")
+        if case_matches:
+            return case_matches[0]
+
+        return None
+
     # ── Issues ────────────────────────────────────────────────
 
     def create_issue(
@@ -262,6 +312,7 @@ class MulticaClient:
         priority: Optional[str] = None,
         assignee_agent_id: Optional[str] = None,
         assignee_user_id: Optional[str] = None,
+        assignee_squad_id: Optional[str] = None,
         project_id: Optional[str] = None,
         parent_issue_id: Optional[str] = None,
         start_date: Optional[str] = None,
@@ -279,7 +330,8 @@ class MulticaClient:
             status: Status (backlog|todo|in_progress|in_review|done|blocked|cancelled)
             priority: Priority (urgent|high|medium|low|none)
             assignee_agent_id: Assigned agent ID
-            assignee_user_id: Assigned user ID (mutually exclusive with agent_id)
+            assignee_user_id: Assigned member/user ID (mutually exclusive with agent_id and squad_id)
+            assignee_squad_id: Assigned squad ID (mutually exclusive with agent_id and user_id)
             project_id: Project ID
             parent_issue_id: Parent issue ID
             start_date: Start date (YYYY-MM-DD)
@@ -303,15 +355,19 @@ class MulticaClient:
                 raise ValueError(f"Invalid priority: {priority}. Valid values: {', '.join(sorted(valid_priorities))}")
             body["priority"] = priority
 
-        # Assign to agent or user
-        if assignee_agent_id and assignee_user_id:
-            raise ValueError("assignee_agent_id and assignee_user_id cannot be specified simultaneously")
+        # Assign to agent, member/user, or squad
+        assignee_count = sum(bool(v) for v in (assignee_agent_id, assignee_user_id, assignee_squad_id))
+        if assignee_count > 1:
+            raise ValueError("assignee_agent_id, assignee_user_id and assignee_squad_id cannot be specified simultaneously")
         if assignee_agent_id:
             body["assignee_type"] = "agent"
             body["assignee_id"] = assignee_agent_id
         elif assignee_user_id:
-            body["assignee_type"] = "user"
+            body["assignee_type"] = "member"
             body["assignee_id"] = assignee_user_id
+        elif assignee_squad_id:
+            body["assignee_type"] = "squad"
+            body["assignee_id"] = assignee_squad_id
 
         if project_id is not None:
             body["project_id"] = project_id
@@ -341,6 +397,7 @@ class MulticaClient:
         title: str,
         project_name: Optional[str] = None,
         agent_name: Optional[str] = None,
+        squad_name: Optional[str] = None,
         workspace_id: Optional[str] = None,
         workspace_slug: Optional[str] = None,
         description: Optional[str] = None,
@@ -359,6 +416,7 @@ class MulticaClient:
             title: Issue title (required)
             project_name: Project name (e.g., "auto_code_review")
             agent_name: Agent name (e.g., "code_reviewer")
+            squad_name: Squad/team name (e.g., "Code Reviewer Team")
             workspace_id: Workspace ID. Auto-detected if not provided.
             workspace_slug: Workspace slug (e.g., "my-workspace").
             description: Issue description
@@ -372,7 +430,11 @@ class MulticaClient:
         """
         project_id = None
         agent_id = None
+        squad_id = None
         ws_id = None
+
+        if agent_name and squad_name:
+            raise ValueError("agent_name and squad_name cannot be specified simultaneously")
 
         # Resolve workspace_id
         if workspace_id or workspace_slug:
@@ -391,6 +453,13 @@ class MulticaClient:
             if not agent:
                 raise ValueError(f"Agent not found: {agent_name}")
             agent_id = agent["id"]
+
+        # Find squad by name
+        if squad_name:
+            squad = self.find_squad_by_name(squad_name, workspace_id, workspace_slug)
+            if not squad:
+                raise ValueError(f"Squad not found: {squad_name}")
+            squad_id = squad["id"]
         
         # Call the original create_issue method
         return self.create_issue(
@@ -399,6 +468,7 @@ class MulticaClient:
             status=status,
             priority=priority,
             assignee_agent_id=agent_id,
+            assignee_squad_id=squad_id,
             project_id=project_id,
             parent_issue_id=parent_issue_id,
             start_date=start_date,
@@ -480,6 +550,16 @@ class MulticaClient:
     def create_comment(self, issue_id: str, content: str) -> dict:
         """Add a comment to an issue"""
         return self._request("POST", f"/api/issues/{issue_id}/comments", json={"content": content})
+
+    def list_comments(self, issue_id: str, workspace_id: Optional[str] = None) -> list[dict]:
+        """List comments on an issue"""
+        params = {}
+        if workspace_id:
+            params["workspace_id"] = workspace_id
+        result = self._request("GET", f"/api/issues/{issue_id}/comments", params=params)
+        if isinstance(result, list):
+            return result
+        return result.get("results", result.get("comments", []))
 
     # ── Labels ────────────────────────────────────────────────
 
